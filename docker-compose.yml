@@ -1,0 +1,21 @@
+# Local Postgres for development / live-ish testing — no Neon account needed.
+#   docker compose up -d
+#   DATABASE_URL=postgres://meta:meta@localhost:5432/meta_ads npm run db:migrate
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: meta
+      POSTGRES_PASSWORD: meta
+      POSTGRES_DB: meta_ads
+    ports:
+      - "5432:5432"
+    volumes:
+      - meta_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meta -d meta_ads"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+volumes:
+  meta_pgdata:

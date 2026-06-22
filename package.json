@@ -11,6 +11,10 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:push": "drizzle-kit push",
+    "db:studio": "drizzle-kit studio",
     "build:standalone": "next build && mkdir -p .next/standalone/public .next/standalone/.next/static && cp -r public/. .next/standalone/public/ && cp -r .next/static/. .next/standalone/.next/static/",
     "desktop": "ELECTRON_DEV=1 electron .",
     "desktop:prod": "npm run build:standalone && electron .",
@@ -26,11 +30,11 @@
     "linux": { "target": ["AppImage"], "icon": "build/icon.png", "category": "Office" }
   },
   "dependencies": {
-    "@neondatabase/serverless": "^1.1.0",
     "@vercel/blob": "^2.4.1",
     "ai": "^6.0.208",
     "drizzle-orm": "^0.45.2",
     "next": "16.2.9",
+    "pg": "^8.13.1",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "zod": "^4.4.3"
@@ -38,6 +42,7 @@
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
+    "@types/pg": "^8.11.10",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "drizzle-kit": "^0.31.10",

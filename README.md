@@ -50,7 +50,7 @@ backstop for the hours the app is closed.
 
 | Var | Purpose |
 |-----|---------|
-| `DATABASE_URL` / `DATABASE_URL_UNPOOLED` | Neon pooled (runtime) / direct (migrations) |
+| `DATABASE_URL` / `DATABASE_URL_UNPOOLED` | any Postgres (local or Neon); `_UNPOOLED` optional, for migrations |
 | `META_API_VERSION`, `META_SYSTEM_USER_TOKEN`, `META_AD_ACCOUNT_ID`, `META_APP_ID/SECRET`, `META_PIXEL_ID` | Meta Marketing API + CAPI — **see [`docs/META_SETUP.md`](docs/META_SETUP.md)** |
 | `AI_GATEWAY_API_KEY`, `COPY_MODEL` | AI copywriting (default `anthropic/claude-sonnet-4-6`) |
 | `BLOB_READ_WRITE_TOKEN` | Creative uploads |
@@ -62,10 +62,22 @@ credentials to light up each module.
 
 ### Database
 
+Runtime uses **node-postgres**, so `DATABASE_URL` can be any Postgres — a local instance or a
+Neon standard connection string.
+
+**Local (no Neon account needed):**
+
 ```bash
-npx drizzle-kit generate   # already generated: drizzle/0000_init, 0001_competitor_creatives
-npx drizzle-kit migrate    # apply to your Neon DB
+docker compose up -d                                   # local Postgres on :5432
+export DATABASE_URL=postgres://meta:meta@localhost:5432/meta_ads
+npm run db:migrate                                     # apply drizzle/ migrations
 ```
+
+**Neon:** put the standard connection string (with `?sslmode=require`) in `DATABASE_URL`, then
+`npm run db:migrate`.
+
+Scripts: `db:generate` (new migration from schema), `db:migrate` (apply), `db:push` (dev sync),
+`db:studio` (browse).
 
 ## Autonomy & safety (read before enabling writes)
 
