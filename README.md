@@ -103,7 +103,9 @@ This app writes to a live ad budget. Safeguards, in order:
    necessary but the platform-level cap is the real last line of defense, especially for the
    hours the desktop app (and its scheduler) is closed.
 
-Configure caps and write mode at **/automation**.
+Configure caps and write mode at **/automation**. For a step-by-step safe go-live sequence
+(database → credentials → caps → first read → first guarded write → launch), follow
+[`docs/LIVE_TESTING.md`](docs/LIVE_TESTING.md).
 
 ## Status
 
