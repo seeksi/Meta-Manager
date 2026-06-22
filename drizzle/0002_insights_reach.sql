@@ -1,0 +1,1 @@
+ALTER TABLE "meta_insights_daily" ADD COLUMN "reach" integer DEFAULT 0 NOT NULL;

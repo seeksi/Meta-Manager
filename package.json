@@ -1,0 +1,52 @@
+{
+  "name": "meta-ads-manager",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Single-operator Meta Ads management desktop app with a guardrailed autonomy engine.",
+  "author": "Meta Ads Manager",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "test": "vitest run",
+    "build:standalone": "next build && mkdir -p .next/standalone/public .next/standalone/.next/static && cp -r public/. .next/standalone/public/ && cp -r .next/static/. .next/standalone/.next/static/",
+    "desktop": "ELECTRON_DEV=1 electron .",
+    "desktop:prod": "npm run build:standalone && electron .",
+    "dist": "npm run build:standalone && electron-builder --linux AppImage"
+  },
+  "build": {
+    "appId": "com.metaadsmanager.desktop",
+    "productName": "Meta Ads Manager",
+    "asar": false,
+    "directories": { "output": "release", "buildResources": "build" },
+    "files": ["electron/**/*", "package.json", "!node_modules/**/*"],
+    "extraResources": [{ "from": ".next/standalone", "to": "standalone" }],
+    "linux": { "target": ["AppImage"], "icon": "build/icon.png", "category": "Office" }
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
+    "@vercel/blob": "^2.4.1",
+    "ai": "^6.0.208",
+    "drizzle-orm": "^0.45.2",
+    "next": "16.2.9",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "drizzle-kit": "^0.31.10",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.9",
+    "tailwindcss": "^4",
+    "typescript": "^5",
+    "vitest": "^4.1.9"
+  }
+}

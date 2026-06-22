@@ -1,0 +1,2 @@
+ALTER TABLE "automation_control" ADD COLUMN "target_cpa_cents" integer DEFAULT 5000 NOT NULL;--> statement-breakpoint
+ALTER TABLE "automation_control" ADD COLUMN "target_roas" numeric DEFAULT '2' NOT NULL;
