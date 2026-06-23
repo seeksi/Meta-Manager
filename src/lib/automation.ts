@@ -1,19 +1,28 @@
 // Autonomy service layer — docs/ARCHITECTURE.md §5. DB-backed propose → guardrail →
 // (Tier A ready | Tier B pending_approval | blocked) → approve/reject → dispatch to the
 // executor (Inngest). Every state change is audited. This module never writes to Meta.
-import { eq, desc, sql, inArray } from "drizzle-orm";
+import { eq, and, desc, sql, inArray } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
+import { z } from "zod";
 import { getDb } from "@/db";
 import { automationControl, adActions, actionAttempts, auditEvents, metricFetches, ads, creatives } from "@/db/schema";
 import {
-  evaluate, tierOf, type ActionType, type ProposedAction, type GuardrailContext,
+  evaluate, tierOf, ACTION_TYPES, type ActionType, type ProposedAction, type GuardrailContext,
 } from "./guardrails";
 import {
-  applyAbsolutePatch, findByLaunchToken, createAdCreative, createAdObject,
+  applyAbsolutePatch, findByLaunchToken, createAdCreative, createAdObject, getDailyBudgetCents,
+  fetchEnabledBudgets, fetchChildAdsetBudgets, getBudgetInfo,
   type AbsolutePatch, type ApplyResult,
 } from "@/lib/meta/client";
 
-const ENV_WRITE_MODE = (process.env.WRITE_MODE ?? "off") as GuardrailContext["envWriteMode"];
+// Parse the env write-mode against a strict whitelist — a typo ("tier-a", "observe ") must NOT
+// fail open. Anything unrecognized → "off".
+const WRITE_MODES = ["off", "observe", "tier_a", "all"] as const;
+function parseWriteMode(v: string | undefined): GuardrailContext["envWriteMode"] {
+  const t = (v ?? "").trim();
+  return (WRITE_MODES as readonly string[]).includes(t) ? (t as GuardrailContext["envWriteMode"]) : "off";
+}
+const ENV_WRITE_MODE = parseWriteMode(process.env.WRITE_MODE);
 
 export async function getControl() {
   const rows = await getDb().select().from(automationControl).limit(1);
@@ -40,12 +49,13 @@ async function metricsFresh(minMinutes: number): Promise<boolean> {
 
 const UNRESOLVED_STATUSES = ["executing", "uncertain"] as const;
 
-/** True if any write is in-flight or uncertain. Gates new spend-increasing proposals (fail closed). */
-async function hasUnresolvedWrites(): Promise<boolean> {
-  const [row] = await getDb()
-    .select({ n: sql<number>`count(*)::int` })
-    .from(adActions)
-    .where(inArray(adActions.status, UNRESOLVED_STATUSES as unknown as string[]));
+/** True if any write is in-flight or uncertain. Gates new spend-increasing proposals (fail closed).
+ *  `excludeId` skips the action currently executing so preflight doesn't deadlock on itself. */
+async function hasUnresolvedWrites(excludeId?: string): Promise<boolean> {
+  const where = excludeId
+    ? sql`${adActions.status} in ('executing','uncertain') and ${adActions.id} <> ${excludeId}`
+    : inArray(adActions.status, UNRESOLVED_STATUSES as unknown as string[]);
+  const [row] = await getDb().select({ n: sql<number>`count(*)::int` }).from(adActions).where(where);
   return (row?.n ?? 0) > 0;
 }
 
@@ -76,6 +86,23 @@ export interface ProposeInput {
   actor?: string;
   idempotencyKey?: string; // deterministic key dedupes repeat proposals (e.g. from the optimizer)
 }
+
+// Trust-boundary validation for the propose/preview API routes. Deltas are signed (decreases
+// are negative); projection is non-negative. Unknown keys rejected.
+export const ProposeInputSchema = z
+  .object({
+    actionType: z.enum(ACTION_TYPES),
+    entityType: z.enum(["account", "campaign", "adset", "ad"]),
+    entityId: z.string().min(1).max(256),
+    targetState: z.record(z.string(), z.unknown()),
+    dailyBudgetDeltaCents: z.number().int().optional(),
+    dailyBudgetDeltaPct: z.number().optional(),
+    projectedDailySpendCents: z.number().int().min(0).optional(),
+    evidence: z.unknown().optional(),
+    actor: z.string().max(64).optional(),
+    idempotencyKey: z.string().max(256).optional(),
+  })
+  .strict();
 
 /** Shared: load control + freshness, build context, run guardrails. No DB writes. */
 async function prepare(input: ProposeInput) {
@@ -127,6 +154,9 @@ export async function proposeAction(input: ProposeInput) {
     entityType: input.entityType,
     entityId: input.entityId,
     targetState: input.targetState,
+    dailyBudgetDeltaCents: input.dailyBudgetDeltaCents ?? 0,
+    dailyBudgetDeltaPct: String(input.dailyBudgetDeltaPct ?? 0),
+    projectedDailySpendCents: input.projectedDailySpendCents ?? 0,
     evidence: input.evidence ?? null,
     guardrailResult: result,
     policyVersion: control.activePolicyVersion,
@@ -172,10 +202,20 @@ export async function resolveUncertain(id: string, applied: boolean, actor = "op
   return row;
 }
 
-/** Approve a Tier B action: re-check happens at executor preflight, then dispatch. */
+/** Approve a Tier B action: only a still-pending, unexpired action may be approved (never a
+ *  blocked/failed/succeeded/uncertain one). The full guardrail re-check happens at executor
+ *  preflight, then dispatch. The status-conditional UPDATE makes the transition atomic. */
 export async function approveAction(id: string, actor = "operator") {
-  const [row] = await getDb().update(adActions)
-    .set({ status: "approved" }).where(eq(adActions.id, id)).returning();
+  const db = getDb();
+  const [action] = await db.select().from(adActions).where(eq(adActions.id, id)).limit(1);
+  if (!action) throw new Error("action not found");
+  if (action.status !== "pending_approval") throw new Error(`cannot approve action in status '${action.status}'`);
+  if (new Date(action.expiresAt) < new Date()) throw new Error("action expired");
+  const [row] = await db.update(adActions)
+    .set({ status: "approved" })
+    .where(and(eq(adActions.id, id), eq(adActions.status, "pending_approval")))
+    .returning();
+  if (!row) throw new Error("action no longer pending approval");
   await audit(actor, "action.approved", id);
   await dispatch(id);
   return row;
@@ -232,13 +272,28 @@ export async function listAudit(limit = 50) {
 }
 
 // ── Executor — the ONLY path that writes to Meta ───────────────────────────────────
-const WRITABLE_FIELDS = new Set(["status", "daily_budget", "lifetime_budget", "name"]);
 
 /** preflight re-check → apply absolute patch → reconcile. Runs inline (single-instance
  *  desktop build, no durable queue). Records every outcome; never rethrows to the caller —
  *  the Meta client retries transient errors internally, and the next poll reconciles
  *  anything left uncertain. ponytail: inline executor; add a durable queue if multi-instance. */
-export async function executeAdAction(actionId: string) {
+// Serialize ALL executor writes so only one Meta write runs at a time. This closes the TOCTOU
+// where two concurrent dispatches both pass the unresolved-writes gate before either flips to
+// `executing` (double-click, scheduler + UI, retries). Sufficient because the app is explicitly
+// single-instance. ponytail: in-process mutex; for multi-instance, use a Postgres advisory lock
+// held across preflight + the Meta write.
+let writeChain: Promise<unknown> = Promise.resolve();
+function serializeWrite<T>(fn: () => Promise<T>): Promise<T> {
+  const run = writeChain.then(fn, fn);
+  writeChain = run.then(() => {}, () => {});
+  return run;
+}
+
+export function executeAdAction(actionId: string) {
+  return serializeWrite(() => runExecute(actionId));
+}
+
+async function runExecute(actionId: string) {
   const pre = await preflightAction(actionId);
   if (!pre.allowed || (!pre.metaPayload && !pre.launch)) {
     return reconcileAction(actionId, { ok: false, error: `preflight: ${pre.reason}` });
@@ -307,7 +362,11 @@ async function runLaunch(actionId: string): Promise<ApplyResult> {
 
 export interface Preflight { allowed: boolean; reason?: string; metaPayload?: AbsolutePatch; launch?: boolean }
 
-/** Re-check guardrails at execution time and build the absolute write payload. */
+const PAUSE_TYPES = new Set<ActionType>(["pause_ad", "pause_adset", "pause_campaign"]);
+const BUDGET_TYPES = new Set<ActionType>(["set_budget", "decrease_budget", "increase_budget"]);
+
+/** Re-check guardrails at execution time and build the absolute write payload. This is the
+ *  ONLY gate before a Meta write, so it is deliberately strict and self-contained. */
 export async function preflightAction(actionId: string): Promise<Preflight> {
   const db = getDb();
   const [action] = await db.select().from(adActions).where(eq(adActions.id, actionId)).limit(1);
@@ -315,22 +374,111 @@ export async function preflightAction(actionId: string): Promise<Preflight> {
   if (action.status !== "approved" && action.status !== "executing") return { allowed: false, reason: `status_${action.status}` };
   if (new Date(action.expiresAt) < new Date()) return { allowed: false, reason: "expired" };
 
-  if (ENV_WRITE_MODE === "off") return { allowed: false, reason: "ENV_WRITE_DISABLED" };
+  const actionType = action.actionType as ActionType;
+  const target = (action.targetState ?? {}) as Record<string, unknown>;
+
+  // ── Semantic validation: the payload must match what the action TYPE claims. Otherwise a
+  // spend-reducing classification (which skips stale/cap gates) could carry a spend-INCREASING
+  // payload (e.g. pause_campaign with {status:"ACTIVE"}). Budget deltas are computed SERVER-side
+  // from live Meta state so the caps never depend on caller-supplied numbers.
+  let deltaCents = 0;
+  let deltaPct = 0;
+  if (PAUSE_TYPES.has(actionType)) {
+    if (String(target.status ?? "").toUpperCase() !== "PAUSED") return { allowed: false, reason: "semantic_pause_requires_PAUSED" };
+  } else if (actionType === "unpause") {
+    if (String(target.status ?? "").toUpperCase() !== "ACTIVE") return { allowed: false, reason: "semantic_unpause_requires_ACTIVE" };
+  } else if (BUDGET_TYPES.has(actionType)) {
+    if (!Number.isInteger(target.daily_budget)) return { allowed: false, reason: "budget_target_not_absolute_integer" };
+    const next = target.daily_budget as number;
+    if (next <= 0) return { allowed: false, reason: "budget_target_must_be_positive" };
+    let current: number | null = null;
+    try { current = await getDailyBudgetCents(action.entityId); } catch { current = null; }
+    if (current == null) return { allowed: false, reason: "budget_current_unknown" }; // fail closed — can't verify the delta
+    deltaCents = next - current;
+    deltaPct = current > 0 ? (deltaCents / current) * 100 : 100;
+    if (actionType === "decrease_budget" && deltaCents >= 0) return { allowed: false, reason: "decrease_must_lower_budget" };
+    if (actionType === "increase_budget" && deltaCents <= 0) return { allowed: false, reason: "increase_must_raise_budget" };
+  }
+
+  // Account-cap projection is computed SERVER-side (never trusts the caller/UI) as the RESULTING
+  // account-wide committed daily budget: sum of every enabled entity's daily budget (CBO campaigns
+  // + ABO adsets) with this action applied. That makes maxAccountDailySpendCents a true ceiling on
+  // budget commitment (spend-so-far would understate it). Checked for spend-INCREASING actions:
+  // a positive budget delta (its new budget) and unpause (the budget that resumes spending).
+  // Reductions / non-budget actions pass 0. Fail closed if the account budget can't be read.
+  let projectedDailySpendCents = 0;
+  const isIncrease = BUDGET_TYPES.has(actionType) && deltaCents > 0;
+  if (isIncrease || actionType === "unpause") {
+    let scan: Awaited<ReturnType<typeof fetchEnabledBudgets>>;
+    try { scan = await fetchEnabledBudgets(); } catch { return { allowed: false, reason: "account_budget_unknown" }; }
+    // Lifetime budgets have no safe daily-cap equivalent → fail closed rather than under-project.
+    if (scan.hasLifetime) return { allowed: false, reason: "lifetime_budget_unsupported" };
+    const sumOthers = Object.entries(scan.daily)
+      .filter(([id]) => id !== action.entityId) // exclude this entity; we add its post-action budget below
+      .reduce((s, [, v]) => s + v, 0);
+    let addBack: number;
+    if (isIncrease) {
+      addBack = target.daily_budget as number; // its new budget
+    } else {
+      // unpause: the budget that resumes spending, derived from the LIVE object via entityId only
+      // (declared entityType is NOT trusted — it can diverge from entityId, and the Meta write
+      // targets entityId regardless). Ad → 0 (parent budget already in sumOthers); CBO campaign /
+      // ABO adset → own daily; paused ABO campaign → its child adsets' daily, summed.
+      let info: Awaited<ReturnType<typeof getBudgetInfo>>;
+      try { info = await getBudgetInfo(action.entityId); } catch { return { allowed: false, reason: "account_budget_unknown" }; }
+      if (!info.isBudgetNode) addBack = 0;
+      else if (info.lifetimeCents != null) return { allowed: false, reason: "lifetime_budget_unsupported" };
+      else if (info.dailyCents != null) addBack = info.dailyCents;
+      else {
+        let child: Awaited<ReturnType<typeof fetchChildAdsetBudgets>>;
+        try { child = await fetchChildAdsetBudgets(action.entityId); } catch { return { allowed: false, reason: "account_budget_unknown" }; }
+        if (child.hasLifetime) return { allowed: false, reason: "lifetime_budget_unsupported" };
+        addBack = child.dailyCents;
+      }
+    }
+    projectedDailySpendCents = sumOthers + addBack;
+  }
+
+  // Re-run the FULL guardrail set against CURRENT state with SERVER-computed delta + projection:
+  // live control caps, metric freshness, and unresolved sibling writes (excluding this action so
+  // it can't deadlock on itself). A hard `block` always fails closed. A Tier A action must
+  // evaluate to `allow` to proceed — if it now needs approval (e.g. its real budget delta exceeds
+  // the cap) we block rather than auto-write. Tier B `require_approval` proceeds (human approved).
   const control = await ensureControl();
-  if (control.emergencyStop || control.writeMode === "off") return { allowed: false, reason: "KILL_SWITCH" };
-  if (action.policyVersion !== control.activePolicyVersion) return { allowed: false, reason: "POLICY_CHANGED" };
+  const fresh = await metricsFresh(control.minMetricFreshnessMinutes);
+  const unresolved = await hasUnresolvedWrites(action.id);
+  const result = evaluate(
+    { actionType, policyVersion: action.policyVersion, dailyBudgetDeltaCents: deltaCents, dailyBudgetDeltaPct: deltaPct },
+    {
+      envWriteMode: ENV_WRITE_MODE,
+      control: {
+        writeMode: control.writeMode as GuardrailContext["control"]["writeMode"],
+        emergencyStop: control.emergencyStop,
+        maxAccountDailySpendCents: control.maxAccountDailySpendCents,
+        maxActionBudgetDeltaCents: control.maxActionBudgetDeltaCents,
+        maxActionBudgetDeltaPct: Number(control.maxActionBudgetDeltaPct),
+        activePolicyVersion: control.activePolicyVersion,
+      },
+      metricsFresh: fresh,
+      unresolvedWrites: unresolved,
+      projectedDailySpendCents,
+    },
+  );
+  if (result.decision === "block") return { allowed: false, reason: result.code };
+  if (result.decision === "require_approval" && tierOf(actionType) === "A") {
+    return { allowed: false, reason: `needs_approval_${result.code}` }; // Tier A must be `allow` to auto-write
+  }
 
   // Launch is a create saga (handled by runLaunch), not an absolute patch.
-  if (action.actionType === "launch_ad") return { allowed: true, launch: true };
+  if (actionType === "launch_ad") return { allowed: true, launch: true };
 
-  // Only absolute, writable fields. Reject non-absolute budget targets (e.g. pct placeholders).
-  const target = (action.targetState ?? {}) as Record<string, unknown>;
-  const fields: Record<string, string | number | boolean> = {};
-  for (const [k, v] of Object.entries(target)) {
-    if (!WRITABLE_FIELDS.has(k)) continue;
-    if (k === "daily_budget" && !Number.isInteger(v)) continue; // must be absolute minor units
-    fields[k] = v as string | number | boolean;
-  }
+  // Build the EXACT payload from the action type — never copy arbitrary fields from targetState
+  // (that would let e.g. decrease_budget smuggle {status:"ACTIVE"} and unpause without approval).
+  let fields: Record<string, string | number | boolean>;
+  if (PAUSE_TYPES.has(actionType)) fields = { status: "PAUSED" };
+  else if (actionType === "unpause") fields = { status: "ACTIVE" };
+  else if (BUDGET_TYPES.has(actionType)) fields = { daily_budget: target.daily_budget as number };
+  else fields = {}; // not supported as an absolute patch (e.g. targeting/structural)
   if (Object.keys(fields).length === 0) return { allowed: false, reason: "no_absolute_writable_fields" };
 
   return {

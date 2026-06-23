@@ -32,16 +32,28 @@ async function graph<T>(
   path: string,
   params: Record<string, string | number> = {},
   method: "GET" | "POST" = "GET",
+  // retry=false for NON-idempotent creates (createAdCreative/createAdObject): retrying a create
+  // whose success response was lost would duplicate the object. They fail closed instead, and the
+  // launch saga reconciles by launch token on the next attempt. GETs and idempotent absolute
+  // patches stay retryable.
+  retry = true,
 ): Promise<T> {
-  const search = new URLSearchParams({ access_token: token() });
+  // Token goes in the Authorization header, NOT the query string — keeps it out of URLs (and
+  // therefore out of any logged/echoed request line or transport-error message).
+  const search = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) search.set(k, String(v));
+  const headers = { Authorization: `Bearer ${token()}` };
 
   for (let attempt = 1; ; attempt++) {
     let res: Response;
-    if (method === "GET") {
-      res = await fetch(`${BASE}/${path}?${search.toString()}`, { method });
-    } else {
-      res = await fetch(`${BASE}/${path}`, { method, body: search });
+    try {
+      res = method === "GET"
+        ? await fetch(`${BASE}/${path}?${search.toString()}`, { method, headers })
+        : await fetch(`${BASE}/${path}`, { method, headers, body: search });
+    } catch {
+      // Transport failure (DNS/TLS/connection). Retry transient; never leak request details.
+      if (retry && attempt < 5) { await sleep(Math.min(2 ** attempt * 250, 8000)); continue; }
+      throw new MetaApiError(-1, undefined, `Network error calling Meta (${method} /${path})`);
     }
     const json = (await res.json()) as { error?: { code: number; error_subcode?: number; message: string } } & T;
 
@@ -49,7 +61,7 @@ async function graph<T>(
       const { code, error_subcode, message } = json.error;
       const retryable = RETRYABLE_CODES.has(code) || error_subcode === 1504022 || error_subcode === 1504039
         || res.status === 429 || res.status >= 500;
-      if (retryable && attempt < 5) {
+      if (retry && retryable && attempt < 5) {
         await sleep(Math.min(2 ** attempt * 250, 8000)); // exp backoff, capped 8s
         continue;
       }
@@ -165,6 +177,96 @@ export async function getDailyBudgetCents(entityId: string): Promise<number | nu
   return obj.daily_budget ? Number(obj.daily_budget) : null;
 }
 
+export interface BudgetInfo {
+  isBudgetNode: boolean;       // false ⇒ the node has no budget fields (e.g. an Ad)
+  dailyCents: number | null;
+  lifetimeCents: number | null;
+}
+
+/** Budget shape of a single object. An Ad has no budget fields → Meta error 100 → isBudgetNode
+ *  false (its spend is governed by the parent adset/campaign). Distinguishes daily vs lifetime so
+ *  callers can fail closed on lifetime (which has no safe daily equivalent for cap projection). */
+export async function getBudgetInfo(entityId: string): Promise<BudgetInfo> {
+  try {
+    const o = await graph<{ daily_budget?: string; lifetime_budget?: string }>(
+      entityId, { fields: "daily_budget,lifetime_budget" },
+    );
+    return {
+      isBudgetNode: true,
+      dailyCents: o.daily_budget ? Number(o.daily_budget) : null,
+      lifetimeCents: o.lifetime_budget ? Number(o.lifetime_budget) : null,
+    };
+  } catch (e) {
+    if (e instanceof MetaApiError && e.code === 100) return { isBudgetNode: false, dailyCents: null, lifetimeCents: null };
+    throw e;
+  }
+}
+
+// Statuses that cannot spend — their budgets don't count toward account exposure.
+const NON_SPENDING_STATUS = new Set(["PAUSED", "CAMPAIGN_PAUSED", "ADSET_PAUSED", "ARCHIVED", "DELETED"]);
+
+export interface BudgetScan { daily: Record<string, number>; hasLifetime: boolean }
+
+async function scanEdgeBudgets(accountId: string, edge: "campaigns" | "adsets", enabledOnly: boolean): Promise<BudgetScan> {
+  const daily: Record<string, number> = {};
+  let hasLifetime = false;
+  let after: string | undefined;
+  let pages = 0;
+  do {
+    const q: Record<string, string | number> = { fields: "id,daily_budget,lifetime_budget,effective_status", limit: 200 };
+    if (after) q.after = after;
+    const res = await graph<{ data: { id: string; daily_budget?: string; lifetime_budget?: string; effective_status?: string }[]; paging?: { next?: string; cursors?: { after?: string } } }>(
+      `${acctPath(accountId)}/${edge}`, q,
+    );
+    for (const o of res.data) {
+      if (enabledOnly && NON_SPENDING_STATUS.has(o.effective_status ?? "")) continue;
+      if (o.lifetime_budget) hasLifetime = true; // lifetime can't be converted to a daily cap figure → flag
+      if (o.daily_budget) daily[o.id] = Number(o.daily_budget);
+    }
+    after = res.paging?.next ? res.paging?.cursors?.after : undefined;
+    pages++;
+  } while (after && pages < 20);
+  // A truncated scan would under-project the cap → fail closed, never return a partial total.
+  if (after) throw new MetaApiError(-2, undefined, `budget scan truncated on /${edge} (too many entities)`);
+  return { daily, hasLifetime };
+}
+
+/** Enabled-account budget exposure: daily budgets of every entity that CAN currently spend (CBO
+ *  campaigns + ABO adsets, mutually exclusive per branch → no double count), plus a flag if ANY
+ *  enabled entity uses a lifetime budget (callers fail closed — lifetime has no safe daily cap
+ *  equivalent). Used to enforce the account daily-spend cap as a hard ceiling. */
+export async function fetchEnabledBudgets(accountId = process.env.META_AD_ACCOUNT_ID ?? ""): Promise<BudgetScan> {
+  const [c, a] = await Promise.all([
+    scanEdgeBudgets(accountId, "campaigns", true),
+    scanEdgeBudgets(accountId, "adsets", true),
+  ]);
+  return { daily: { ...c.daily, ...a.daily }, hasLifetime: c.hasLifetime || a.hasLifetime };
+}
+
+/** Child adsets' budget exposure under a campaign (ALL statuses) — the budget that resumes when a
+ *  paused ABO campaign is unpaused. Returns summed daily + a lifetime flag (caller fails closed). */
+export async function fetchChildAdsetBudgets(campaignId: string): Promise<{ dailyCents: number; hasLifetime: boolean }> {
+  let dailyCents = 0;
+  let hasLifetime = false;
+  let after: string | undefined;
+  let pages = 0;
+  do {
+    const q: Record<string, string | number> = { fields: "daily_budget,lifetime_budget", limit: 200 };
+    if (after) q.after = after;
+    const res = await graph<{ data: { daily_budget?: string; lifetime_budget?: string }[]; paging?: { next?: string; cursors?: { after?: string } } }>(
+      `${campaignId}/adsets`, q,
+    );
+    for (const a of res.data) {
+      if (a.lifetime_budget) hasLifetime = true;
+      if (a.daily_budget) dailyCents += Number(a.daily_budget);
+    }
+    after = res.paging?.next ? res.paging?.cursors?.after : undefined;
+    pages++;
+  } while (after && pages < 20);
+  if (after) throw new MetaApiError(-2, undefined, "child adset budget scan truncated (too many adsets)");
+  return { dailyCents, hasLifetime };
+}
+
 export async function applyAbsolutePatch(patch: AbsolutePatch): Promise<ApplyResult> {
   // POST to /{object_id} with the absolute fields. daily_budget is in minor units (cents).
   const params: Record<string, string | number> = {};
@@ -179,15 +281,30 @@ export async function applyAbsolutePatch(patch: AbsolutePatch): Promise<ApplyRes
 const LAUNCH_LIST_LIMIT = 200;
 
 /** Find existing creatives/ads whose name carries `[launch:<token>]`. Used to adopt objects a
- *  crashed retry already created (dedup). >1 match = ambiguous → caller must fail closed. */
+ *  crashed retry already created (dedup). >1 match = ambiguous → caller must fail closed.
+ *  Paginates (up to 20 pages × 200) so a match isn't missed past the first page — a missed match
+ *  would mean a duplicate create, the exact failure this reconciliation exists to prevent. */
 export async function findByLaunchToken(
   accountId: string, edge: "adcreatives" | "ads", token: string,
 ): Promise<string[]> {
-  const res = await graph<{ data: { id: string; name?: string }[] }>(
-    `${acctPath(accountId)}/${edge}`, { fields: "id,name", limit: LAUNCH_LIST_LIMIT },
-  );
   const tag = `[launch:${token}]`;
-  return res.data.filter((o) => (o.name ?? "").includes(tag)).map((o) => o.id);
+  const ids: string[] = [];
+  let after: string | undefined;
+  let pages = 0;
+  do {
+    const q: Record<string, string | number> = { fields: "id,name", limit: LAUNCH_LIST_LIMIT };
+    if (after) q.after = after;
+    const res = await graph<{ data: { id: string; name?: string }[]; paging?: { next?: string; cursors?: { after?: string } } }>(
+      `${acctPath(accountId)}/${edge}`, q,
+    );
+    for (const o of res.data) if ((o.name ?? "").includes(tag)) ids.push(o.id);
+    after = res.paging?.next ? res.paging?.cursors?.after : undefined;
+    pages++;
+  } while (after && pages < 20);
+  // Truncating the search could miss an object a crashed retry already created → duplicate.
+  // Fail closed so the launch saga aborts (marks uncertain) instead of risking a duplicate create.
+  if (after) throw new MetaApiError(-2, undefined, `launch-token search truncated on /${edge} (too many objects)`);
+  return ids;
 }
 
 export interface CreativeSpec {
@@ -207,7 +324,7 @@ export async function createAdCreative(accountId: string, spec: CreativeSpec): P
   const res = await graph<{ id: string }>(`${acctPath(accountId)}/adcreatives`, {
     name: spec.name,
     object_story_spec: JSON.stringify({ page_id: spec.pageId, link_data: linkData }),
-  }, "POST");
+  }, "POST", false); // non-idempotent create — no retry (fail closed, reconcile by launch token)
   return res.id;
 }
 
@@ -218,7 +335,7 @@ export async function createAdObject(
   const res = await graph<{ id: string }>(`${acctPath(accountId)}/ads`, {
     name: spec.name, adset_id: spec.adsetId,
     creative: JSON.stringify({ creative_id: spec.creativeId }), status: "PAUSED",
-  }, "POST");
+  }, "POST", false); // non-idempotent create — no retry (fail closed, reconcile by launch token)
   return res.id;
 }
 

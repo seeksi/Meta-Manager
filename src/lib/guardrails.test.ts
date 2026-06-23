@@ -84,9 +84,50 @@ describe("guardrails.evaluate — default-deny safety", () => {
     expect(evaluate(action(), ctx({ projectedDailySpendCents: 200_00 })).code).toBe("ACCOUNT_CAP");
   });
 
+  it("blocks a Tier B budget increase over the account cap (cap is an absolute ceiling, not just Tier A)", () => {
+    const r = evaluate(action({ actionType: "increase_budget" }), ctx({ projectedDailySpendCents: 200_00 }));
+    expect(r.decision).toBe("block");
+    expect(r.code).toBe("ACCOUNT_CAP");
+  });
+
+  it("does NOT cap-block a decrease even when already over the account cap (must reduce exposure)", () => {
+    expect(evaluate(action({ actionType: "decrease_budget" }), ctx({ projectedDailySpendCents: 200_00 })).decision).toBe("allow");
+  });
+
+  it("does NOT cap-block a pause even when already over the account cap", () => {
+    expect(evaluate(action({ actionType: "pause_campaign" }), ctx({ projectedDailySpendCents: 200_00 })).decision).toBe("allow");
+  });
+
+  it("fails closed on an unknown/garbled write mode (treated as off, not fail-open)", () => {
+    expect(evaluate(action(), ctx({ envWriteMode: "tier-a" as unknown as "all" })).decision).toBe("block");
+  });
+
   it("allows a small Tier A change within all caps", () => {
     const r = evaluate(action({ dailyBudgetDeltaCents: 5_00, dailyBudgetDeltaPct: 10 }), ctx());
     expect(r.decision).toBe("allow");
+  });
+
+  it("blocks ALL writes in observe mode (env)", () => {
+    expect(evaluate(action({ actionType: "decrease_budget" }), ctx({ envWriteMode: "observe" })).code).toBe("OBSERVE_MODE");
+  });
+
+  it("blocks ALL writes in observe mode (control)", () => {
+    expect(evaluate(action(), ctx({ control: { ...baseControl, writeMode: "observe" } })).code).toBe("OBSERVE_MODE");
+  });
+
+  it("forbids Tier B under tier_a write mode (not merely queued for approval)", () => {
+    const r = evaluate(action({ actionType: "increase_budget" }), ctx({ control: { ...baseControl, writeMode: "tier_a" } }));
+    expect(r.decision).toBe("block");
+    expect(r.code).toBe("TIER_B_FORBIDDEN");
+  });
+
+  it("still allows Tier A under tier_a write mode", () => {
+    const r = evaluate(action({ dailyBudgetDeltaCents: 5_00, dailyBudgetDeltaPct: 10 }), ctx({ control: { ...baseControl, writeMode: "tier_a" } }));
+    expect(r.decision).toBe("allow");
+  });
+
+  it("effective mode is the stricter of env and control (env tier_a blocks Tier B even if control=all)", () => {
+    expect(evaluate(action({ actionType: "create_campaign" }), ctx({ envWriteMode: "tier_a" })).code).toBe("TIER_B_FORBIDDEN");
   });
 });
 

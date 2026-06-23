@@ -106,6 +106,10 @@ export const adActions = pgTable("ad_actions", {
   entityType: text("entity_type").notNull(),
   entityId: text("entity_id").notNull(),
   targetState: jsonb("target_state").notNull(), // absolute target, never deltas
+  // Persisted so the executor can RE-RUN guardrails at write time (caps depend on these).
+  dailyBudgetDeltaCents: integer("daily_budget_delta_cents").notNull().default(0),
+  dailyBudgetDeltaPct: numeric("daily_budget_delta_pct").notNull().default("0"),
+  projectedDailySpendCents: integer("projected_daily_spend_cents").notNull().default(0),
   evidence: jsonb("evidence"),
   guardrailResult: jsonb("guardrail_result"),
   policyVersion: integer("policy_version").notNull(),

@@ -171,10 +171,20 @@ export async function runOptimization(override: Partial<OptimizerConfig> = {}) {
     .sort((x, y) => y.agg.spendCents - x.agg.spendCents)
     .slice(0, cfg.maxProposalsPerRun);
 
+  // Account's most-recent-day actual spend = baseline for projecting post-change account spend,
+  // which the account-daily-spend-cap guardrail checks. (Spend ≈ budget for a campaign that
+  // spends to budget; +delta is a sound conservative projection.)
+  const day = String(latest.day).slice(0, 10);
+  const accountDailySpendCents = rows
+    .filter((r) => String(r.dateStart).slice(0, 10) === day)
+    .reduce((s, r) => s + r.spendCents, 0);
+
   const minViableBudgetCents = Math.max(20_00, 2 * cfg.targetCpaCents); // don't starve to nothing
   let created = 0;
   for (const p of proposals) {
     let targetState: Record<string, unknown>;
+    let deltaCents = 0; // signed: +increase / -decrease; 0 for pause (status change)
+    let deltaPct = 0;   // relative to current daily budget
     if (p.actionType === "pause_campaign") {
       targetState = { status: "PAUSED" };
     } else {
@@ -191,12 +201,18 @@ export async function runOptimization(override: Partial<OptimizerConfig> = {}) {
         if (next <= current) continue; // already at cap
       }
       targetState = { daily_budget: next };
+      deltaCents = next - current;
+      deltaPct = current > 0 ? (deltaCents / current) * 100 : 0;
     }
     await proposeAction({
       actionType: p.actionType,
       entityType: p.agg.entityType,
       entityId: p.agg.entityId,
       targetState,
+      // Deltas drive the per-action + account-cap guardrails (incl. the executor's re-check).
+      dailyBudgetDeltaCents: deltaCents,
+      dailyBudgetDeltaPct: deltaPct,
+      projectedDailySpendCents: accountDailySpendCents + deltaCents,
       evidence: buildEvidence(p, cfg, start, latest.day),
       actor: "optimizer",
       // Deterministic key: dedupes repeat proposals for the same entity+action+rule.

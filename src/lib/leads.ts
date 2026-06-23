@@ -51,6 +51,9 @@ export async function captureLead(input: CaptureInput) {
 
   // Forward to Meta CAPI for attribution/optimization (event_id = lead id, dedups with the
   // browser pixel). Fire-and-forget: a CAPI hiccup must not fail lead capture.
+  // NOTE: CAPI is an attribution event, NOT an ad-entity/budget write — it is intentionally
+  // outside the executor + kill-switch guardrails (those gate ad spend). Conversion signal keeps
+  // flowing even when ad writes are halted; it can never change spend.
   // ponytail: enqueue + retry the event instead of fire-and-forget when this moves off desktop.
   if (process.env.META_PIXEL_ID) {
     import("@/lib/meta/client")

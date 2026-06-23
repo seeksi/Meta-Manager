@@ -1,12 +1,16 @@
 import { NextResponse } from "next/server";
-import { proposeAction, type ProposeInput } from "@/lib/automation";
+import { proposeAction, ProposeInputSchema } from "@/lib/automation";
 
 export async function POST(req: Request) {
+  const parsed = ProposeInputSchema.safeParse(await req.json().catch(() => null));
+  if (!parsed.success) {
+    return NextResponse.json({ error: "Invalid action", issues: parsed.error.issues }, { status: 400 });
+  }
   try {
-    const input = (await req.json()) as ProposeInput;
-    const action = await proposeAction(input);
+    const action = await proposeAction(parsed.data);
     return NextResponse.json({ action });
   } catch (e) {
-    return NextResponse.json({ error: String(e) }, { status: 503 });
+    console.error("[actions] propose failed:", e);
+    return NextResponse.json({ error: "internal error" }, { status: 503 });
   }
 }
