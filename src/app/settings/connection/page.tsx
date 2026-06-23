@@ -1,6 +1,7 @@
 // Module 1 — Meta API onboarding. Guided checklist + verify. docs/PRODUCT_SPEC.md §1.
 import { PageHeader, Card } from "@/components/ui";
 import { VerifyButton } from "@/components/verify-button";
+import { SettingsTabs } from "@/components/settings-tabs";
 import { connectionStatus } from "@/lib/connection";
 
 export const dynamic = "force-dynamic";
@@ -12,6 +13,7 @@ export default function ConnectionPage() {
   return (
     <div>
       <PageHeader title="Meta Connection" subtitle={`Marketing API ${status.apiVersion}`} />
+      <SettingsTabs />
 
       <Card className="mb-4">
         <h2 className="mb-3 font-medium">Setup checklist</h2>
