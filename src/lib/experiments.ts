@@ -3,6 +3,7 @@
 import { eq, desc, and, gte, inArray } from "drizzle-orm";
 import { getDb } from "@/db";
 import { experiments, metaInsightsDaily } from "@/db/schema";
+import { getClient } from "@/lib/clients";
 
 // ── Statistics (pure, tested) ───────────────────────────────────────────────────
 // Abramowitz & Stegun 7.1.26 error-function approximation.
@@ -41,8 +42,9 @@ export interface ExperimentInput {
   variantAId: string; variantBId: string; startedAt?: string;
 }
 
-export async function createExperiment(input: ExperimentInput) {
+export async function createExperiment(clientId: string, input: ExperimentInput) {
   const [row] = await getDb().insert(experiments).values({
+    clientId,
     name: input.name, hypothesis: input.hypothesis ?? null, metric: input.metric ?? "cvr",
     variantAId: input.variantAId, variantBId: input.variantBId,
     startedAt: input.startedAt ?? new Date().toISOString().slice(0, 10),
@@ -50,15 +52,15 @@ export async function createExperiment(input: ExperimentInput) {
   return row;
 }
 
-export async function listExperiments() {
-  return getDb().select().from(experiments).orderBy(desc(experiments.createdAt));
+export async function listExperiments(clientId: string) {
+  return getDb().select().from(experiments)
+    .where(eq(experiments.clientId, clientId)).orderBy(desc(experiments.createdAt));
 }
 
-async function variantTotals(entityIds: string[], since: string | null) {
+async function variantTotals(accountId: string, entityIds: string[], since: string | null) {
   const db = getDb();
-  const where = since
-    ? and(inArray(metaInsightsDaily.entityId, entityIds), gte(metaInsightsDaily.dateStart, since))
-    : inArray(metaInsightsDaily.entityId, entityIds);
+  const base = and(eq(metaInsightsDaily.metaAccountId, accountId), inArray(metaInsightsDaily.entityId, entityIds));
+  const where = since ? and(base, gte(metaInsightsDaily.dateStart, since)) : base;
   const rows = await db.select().from(metaInsightsDaily).where(where);
   const totals = new Map<string, { clicks: number; purchases: number }>();
   for (const id of entityIds) totals.set(id, { clicks: 0, purchases: 0 });
@@ -69,10 +71,13 @@ async function variantTotals(entityIds: string[], since: string | null) {
   return totals;
 }
 
-export async function getExperimentResult(id: string) {
-  const [exp] = await getDb().select().from(experiments).where(eq(experiments.id, id)).limit(1);
+export async function getExperimentResult(clientId: string, id: string) {
+  const [exp] = await getDb().select().from(experiments)
+    .where(and(eq(experiments.id, id), eq(experiments.clientId, clientId))).limit(1);
   if (!exp) return null;
-  const totals = await variantTotals([exp.variantAId, exp.variantBId], exp.startedAt);
+  const client = await getClient(clientId);
+  if (!client) return null;
+  const totals = await variantTotals(client.metaAccountId, [exp.variantAId, exp.variantBId], exp.startedAt);
   const a = totals.get(exp.variantAId)!;
   const b = totals.get(exp.variantBId)!;
   // metric "cvr": conversions = purchases, trials = clicks.

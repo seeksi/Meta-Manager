@@ -2,6 +2,7 @@
 import { PageHeader, Card } from "@/components/ui";
 import { CreativeUploader } from "@/components/creative-uploader";
 import { listCreatives } from "@/lib/creatives";
+import { BOOTSTRAP_CLIENT_ID } from "@/lib/clients";
 
 export const dynamic = "force-dynamic";
 
@@ -9,7 +10,7 @@ export default async function CreativesPage() {
   let items: Awaited<ReturnType<typeof listCreatives>> = [];
   let dbError: string | null = null;
   try {
-    items = await listCreatives();
+    items = await listCreatives(BOOTSTRAP_CLIENT_ID); // ponytail: bootstrap client until switcher lands
   } catch (e) {
     dbError = e instanceof Error ? e.message : String(e);
   }

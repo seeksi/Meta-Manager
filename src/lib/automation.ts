@@ -5,7 +5,8 @@ import { eq, and, desc, sql, inArray } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { getDb } from "@/db";
-import { automationControl, adActions, actionAttempts, auditEvents, metricFetches, ads, creatives } from "@/db/schema";
+import { automationControl, agencyControl, adActions, actionAttempts, auditEvents, metricFetches, ads, creatives } from "@/db/schema";
+import { clientContext, getClient, type ClientContext } from "@/lib/clients";
 import {
   evaluate, tierOf, ACTION_TYPES, type ActionType, type ProposedAction, type GuardrailContext,
 } from "./guardrails";
@@ -24,23 +25,57 @@ function parseWriteMode(v: string | undefined): GuardrailContext["envWriteMode"]
 }
 const ENV_WRITE_MODE = parseWriteMode(process.env.WRITE_MODE);
 
-export async function getControl() {
-  const rows = await getDb().select().from(automationControl).limit(1);
+export async function getControl(clientId: string) {
+  const rows = await getDb().select().from(automationControl)
+    .where(eq(automationControl.clientId, clientId)).limit(1);
   return rows[0] ?? null;
 }
 
-/** Ensure the singleton control row exists (safe defaults: kill engaged, write_mode off). */
-export async function ensureControl() {
-  const existing = await getControl();
+/** Ensure this client's control row exists. observe→graduate defaults: kill engaged, write_mode off. */
+export async function ensureControl(clientId: string) {
+  const existing = await getControl(clientId);
   if (existing) return existing;
-  const [row] = await getDb().insert(automationControl).values({ id: true }).returning();
+  await getDb().insert(automationControl)
+    .values({ clientId, writeMode: "off", emergencyStop: true })
+    .onConflictDoNothing({ target: automationControl.clientId });
+  return (await getControl(clientId))!;
+}
+
+// ── Agency master gate (singleton, layered ABOVE every per-client control) ──────────
+export async function getAgencyControl() {
+  const [row] = await getDb().select().from(agencyControl).limit(1);
+  return row ?? null;
+}
+
+/** Ensure the agency master row exists. Per-client gates enforce default-deny for new clients. */
+export async function ensureAgencyControl() {
+  const existing = await getAgencyControl();
+  if (existing) return existing;
+  await getDb().insert(agencyControl).values({ id: true, emergencyStop: false }).onConflictDoNothing();
+  return (await getAgencyControl())!;
+}
+
+export async function setAgencyControl(patch: { emergencyStop?: boolean }, actor = "operator") {
+  await ensureAgencyControl();
+  const values: Record<string, unknown> = { updatedAt: new Date() };
+  if (patch.emergencyStop !== undefined) values.emergencyStop = patch.emergencyStop;
+  const [row] = await getDb().update(agencyControl).set(values).where(eq(agencyControl.id, true)).returning();
+  await audit(null, actor, "agency.control.updated", null, JSON.stringify(patch));
   return row;
 }
 
-async function metricsFresh(minMinutes: number): Promise<boolean> {
+/** Agency-wide kill: halts writes for EVERY client at once. */
+export async function engageAgencyKill(actor = "operator") {
+  return setAgencyControl({ emergencyStop: true }, actor);
+}
+
+// Per-client freshness signal: the most recent insights fetch for THIS client's ad account
+// (ingestInsights stamps metric_fetches.request = { accountId }). No schema change needed.
+async function metricsFresh(accountId: string, minMinutes: number): Promise<boolean> {
   const [row] = await getDb()
     .select({ fetchedAt: metricFetches.fetchedAt })
     .from(metricFetches)
+    .where(sql`${metricFetches.request}->>'accountId' = ${accountId}`)
     .orderBy(desc(metricFetches.fetchedAt))
     .limit(1);
   if (!row?.fetchedAt) return false; // no data → not fresh → blocks spend increases (safe)
@@ -49,24 +84,55 @@ async function metricsFresh(minMinutes: number): Promise<boolean> {
 
 const UNRESOLVED_STATUSES = ["executing", "uncertain"] as const;
 
-/** True if any write is in-flight or uncertain. Gates new spend-increasing proposals (fail closed).
- *  `excludeId` skips the action currently executing so preflight doesn't deadlock on itself. */
-async function hasUnresolvedWrites(excludeId?: string): Promise<boolean> {
+/** True if any write FOR THIS CLIENT is in-flight or uncertain. Gates new spend-increasing
+ *  proposals (fail closed). `excludeId` skips the action currently executing so preflight doesn't
+ *  deadlock on itself. Scoped by clientId so one client's stuck write never blocks another's. */
+async function hasUnresolvedWrites(clientId: string, excludeId?: string): Promise<boolean> {
   const where = excludeId
-    ? sql`${adActions.status} in ('executing','uncertain') and ${adActions.id} <> ${excludeId}`
-    : inArray(adActions.status, UNRESOLVED_STATUSES as unknown as string[]);
+    ? sql`${adActions.clientId} = ${clientId} and ${adActions.status} in ('executing','uncertain') and ${adActions.id} <> ${excludeId}`
+    : sql`${adActions.clientId} = ${clientId} and ${adActions.status} in ('executing','uncertain')`;
   const [row] = await getDb().select({ n: sql<number>`count(*)::int` }).from(adActions).where(where);
   return (row?.n ?? 0) > 0;
 }
 
 async function audit(
-  actor: string, eventType: string, subjectId: string | null,
+  clientId: string | null, actor: string, eventType: string, subjectId: string | null,
   after: unknown = null, reason: string | null = null,
 ) {
   await getDb().insert(auditEvents).values({
-    actor, eventType, subjectId, after, reason,
+    clientId, actor, eventType, subjectId, after, reason,
     actionId: subjectId,
   });
+}
+
+/** Per-client guardrail context: this client's control row, metric freshness, unresolved-write
+ *  flag, with effective kill = agency.emergencyStop OR client.emergencyStop. The pure evaluate()
+ *  is untouched — only its context source is per-client now. */
+export async function buildGuardrailContext(
+  clientId: string,
+  opts: { projectedDailySpendCents?: number; excludeActionId?: string } = {},
+) {
+  const client = await getClient(clientId);
+  if (!client) throw new Error(`unknown client: ${clientId}`);
+  const control = await ensureControl(clientId);
+  const agency = await ensureAgencyControl();
+  const fresh = await metricsFresh(client.metaAccountId, control.minMetricFreshnessMinutes);
+  const unresolved = await hasUnresolvedWrites(clientId, opts.excludeActionId);
+  const ctx: GuardrailContext = {
+    envWriteMode: ENV_WRITE_MODE,
+    control: {
+      writeMode: control.writeMode as GuardrailContext["control"]["writeMode"],
+      emergencyStop: agency.emergencyStop || control.emergencyStop, // effective kill = agency OR client
+      maxAccountDailySpendCents: control.maxAccountDailySpendCents,
+      maxActionBudgetDeltaCents: control.maxActionBudgetDeltaCents,
+      maxActionBudgetDeltaPct: Number(control.maxActionBudgetDeltaPct),
+      activePolicyVersion: control.activePolicyVersion,
+    },
+    metricsFresh: fresh,
+    unresolvedWrites: unresolved,
+    projectedDailySpendCents: opts.projectedDailySpendCents ?? 0,
+  };
+  return { control, ctx };
 }
 
 async function dispatch(actionId: string) {
@@ -75,6 +141,7 @@ async function dispatch(actionId: string) {
 }
 
 export interface ProposeInput {
+  clientId: string;
   actionType: ActionType;
   entityType: string;
   entityId: string;
@@ -91,6 +158,7 @@ export interface ProposeInput {
 // are negative); projection is non-negative. Unknown keys rejected.
 export const ProposeInputSchema = z
   .object({
+    clientId: z.string().uuid(),
     actionType: z.enum(ACTION_TYPES),
     entityType: z.enum(["account", "campaign", "adset", "ad"]),
     entityId: z.string().min(1).max(256),
@@ -104,30 +172,16 @@ export const ProposeInputSchema = z
   })
   .strict();
 
-/** Shared: load control + freshness, build context, run guardrails. No DB writes. */
+/** Shared: load this client's control + freshness, build context, run guardrails. No DB writes. */
 async function prepare(input: ProposeInput) {
-  const control = await ensureControl();
-  const fresh = await metricsFresh(control.minMetricFreshnessMinutes);
-  const unresolved = await hasUnresolvedWrites();
+  const { control, ctx } = await buildGuardrailContext(input.clientId, {
+    projectedDailySpendCents: input.projectedDailySpendCents ?? 0,
+  });
   const action: ProposedAction = {
     actionType: input.actionType,
     policyVersion: control.activePolicyVersion,
     dailyBudgetDeltaCents: input.dailyBudgetDeltaCents ?? 0,
     dailyBudgetDeltaPct: input.dailyBudgetDeltaPct ?? 0,
-  };
-  const ctx: GuardrailContext = {
-    envWriteMode: ENV_WRITE_MODE,
-    control: {
-      writeMode: control.writeMode as GuardrailContext["control"]["writeMode"],
-      emergencyStop: control.emergencyStop,
-      maxAccountDailySpendCents: control.maxAccountDailySpendCents,
-      maxActionBudgetDeltaCents: control.maxActionBudgetDeltaCents,
-      maxActionBudgetDeltaPct: Number(control.maxActionBudgetDeltaPct),
-      activePolicyVersion: control.activePolicyVersion,
-    },
-    metricsFresh: fresh,
-    unresolvedWrites: unresolved,
-    projectedDailySpendCents: input.projectedDailySpendCents ?? 0,
   };
   return { control, result: evaluate(action, ctx) };
 }
@@ -148,6 +202,7 @@ export async function proposeAction(input: ProposeInput) {
 
   const idempotencyKey = input.idempotencyKey ?? randomUUID();
   const [row] = await getDb().insert(adActions).values({
+    clientId: input.clientId,
     tier: tierOf(input.actionType),
     status,
     actionType: input.actionType,
@@ -171,21 +226,21 @@ export async function proposeAction(input: ProposeInput) {
     return existing;
   }
 
-  await audit(input.actor ?? "system", "action.proposed", row.id, { status, result });
+  await audit(input.clientId, input.actor ?? "system", "action.proposed", row.id, { status, result });
   if (status === "approved") await dispatch(row.id);
   return row;
 }
 
-export async function listQueue() {
+export async function listQueue(clientId: string) {
   return getDb().select().from(adActions)
-    .where(eq(adActions.status, "pending_approval"))
+    .where(and(eq(adActions.clientId, clientId), eq(adActions.status, "pending_approval")))
     .orderBy(desc(adActions.createdAt));
 }
 
 /** In-flight or post-crash writes awaiting reconciliation. Drives the unresolved-writes UI. */
-export async function listUnresolved() {
+export async function listUnresolved(clientId: string) {
   return getDb().select().from(adActions)
-    .where(inArray(adActions.status, UNRESOLVED_STATUSES as unknown as string[]))
+    .where(and(eq(adActions.clientId, clientId), inArray(adActions.status, UNRESOLVED_STATUSES as unknown as string[])))
     .orderBy(desc(adActions.createdAt));
 }
 
@@ -198,7 +253,7 @@ export async function resolveUncertain(id: string, applied: boolean, actor = "op
   await db.insert(actionAttempts).values({ actionId: id, attempt: count + 1, error: applied ? null : "operator: not applied" });
   const status = applied ? "succeeded" : "failed";
   const [row] = await db.update(adActions).set({ status }).where(eq(adActions.id, id)).returning();
-  await audit(actor, `action.${status}`, id, null, "operator-resolved uncertain write");
+  if (row) await audit(row.clientId, actor, `action.${status}`, id, null, "operator-resolved uncertain write");
   return row;
 }
 
@@ -216,7 +271,7 @@ export async function approveAction(id: string, actor = "operator") {
     .where(and(eq(adActions.id, id), eq(adActions.status, "pending_approval")))
     .returning();
   if (!row) throw new Error("action no longer pending approval");
-  await audit(actor, "action.approved", id);
+  await audit(action.clientId, actor, "action.approved", id);
   await dispatch(id);
   return row;
 }
@@ -224,17 +279,17 @@ export async function approveAction(id: string, actor = "operator") {
 export async function rejectAction(id: string, actor = "operator") {
   const [row] = await getDb().update(adActions)
     .set({ status: "rejected" }).where(eq(adActions.id, id)).returning();
-  await audit(actor, "action.rejected", id);
+  if (row) await audit(row.clientId, actor, "action.rejected", id);
   return row;
 }
 
-/** Kill switch: halt all writes immediately. */
-export async function engageKill(actor = "operator") {
-  await ensureControl();
+/** Per-client kill switch: halt THIS client's writes immediately. */
+export async function engageKill(clientId: string, actor = "operator") {
+  await ensureControl(clientId);
   const [row] = await getDb().update(automationControl)
     .set({ emergencyStop: true, writeMode: "off", updatedAt: new Date(), updatedBy: actor })
-    .where(eq(automationControl.id, true)).returning();
-  await audit(actor, "kill_switch.engaged", null);
+    .where(eq(automationControl.clientId, clientId)).returning();
+  await audit(clientId, actor, "kill_switch.engaged", null);
   return row;
 }
 
@@ -249,8 +304,8 @@ export interface ControlPatch {
   targetRoas?: number;
 }
 
-export async function setControl(patch: ControlPatch, actor = "operator") {
-  await ensureControl();
+export async function setControl(clientId: string, patch: ControlPatch, actor = "operator") {
+  await ensureControl(clientId);
   const values: Record<string, unknown> = { updatedAt: new Date(), updatedBy: actor };
   if (patch.writeMode !== undefined) values.writeMode = patch.writeMode;
   if (patch.emergencyStop !== undefined) values.emergencyStop = patch.emergencyStop;
@@ -262,13 +317,19 @@ export async function setControl(patch: ControlPatch, actor = "operator") {
   if (patch.targetRoas !== undefined) values.targetRoas = String(patch.targetRoas);
 
   const [row] = await getDb().update(automationControl)
-    .set(values).where(eq(automationControl.id, true)).returning();
-  await audit(actor, "control.updated", null, JSON.stringify(patch));
+    .set(values).where(eq(automationControl.clientId, clientId)).returning();
+  await audit(clientId, actor, "control.updated", null, JSON.stringify(patch));
   return row;
 }
 
-export async function listAudit(limit = 50) {
-  return getDb().select().from(auditEvents).orderBy(desc(auditEvents.createdAt)).limit(limit);
+/** Audit feed. Per-client when `clientId` is given; with no clientId this is the INTENTIONAL
+ *  agency-wide read (all clients) for the agency audit/export view. */
+export async function listAudit(clientId?: string, limit = 50) {
+  const q = getDb().select().from(auditEvents);
+  const rows = clientId
+    ? q.where(eq(auditEvents.clientId, clientId))
+    : q; // agency-wide audit read (deliberate cross-client)
+  return rows.orderBy(desc(auditEvents.createdAt)).limit(limit);
 }
 
 // ── Executor — the ONLY path that writes to Meta ───────────────────────────────────
@@ -277,30 +338,35 @@ export async function listAudit(limit = 50) {
  *  desktop build, no durable queue). Records every outcome; never rethrows to the caller —
  *  the Meta client retries transient errors internally, and the next poll reconciles
  *  anything left uncertain. ponytail: inline executor; add a durable queue if multi-instance. */
-// Serialize ALL executor writes so only one Meta write runs at a time. This closes the TOCTOU
-// where two concurrent dispatches both pass the unresolved-writes gate before either flips to
-// `executing` (double-click, scheduler + UI, retries). Sufficient because the app is explicitly
-// single-instance. ponytail: in-process mutex; for multi-instance, use a Postgres advisory lock
-// held across preflight + the Meta write.
-let writeChain: Promise<unknown> = Promise.resolve();
-function serializeWrite<T>(fn: () => Promise<T>): Promise<T> {
-  const run = writeChain.then(fn, fn);
-  writeChain = run.then(() => {}, () => {});
+// Serialize executor writes PER CLIENT so only one Meta write per client runs at a time, while
+// different clients run concurrently. This closes the TOCTOU where two concurrent dispatches for
+// the same client both pass the unresolved-writes gate before either flips to `executing`
+// (double-click, scheduler + UI, retries). ponytail: in-process per-client mutex; durable queue +
+// Postgres advisory locks (held across preflight + the Meta write) for multi-instance = WS-3.
+const writeChains = new Map<string, Promise<unknown>>();
+function serializeWrite<T>(clientId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = writeChains.get(clientId) ?? Promise.resolve();
+  const run = prev.then(fn, fn);
+  writeChains.set(clientId, run.then(() => {}, () => {}));
   return run;
 }
 
-export function executeAdAction(actionId: string) {
-  return serializeWrite(() => runExecute(actionId));
+export async function executeAdAction(actionId: string) {
+  const [action] = await getDb()
+    .select({ clientId: adActions.clientId }).from(adActions).where(eq(adActions.id, actionId)).limit(1);
+  if (!action) return { status: "failed" as const, error: "execute: action not found" };
+  const ctx = await clientContext(action.clientId);
+  return serializeWrite(action.clientId, () => runExecute(actionId, ctx));
 }
 
-async function runExecute(actionId: string) {
-  const pre = await preflightAction(actionId);
+async function runExecute(actionId: string, ctx: ClientContext) {
+  const pre = await preflightAction(actionId, ctx);
   if (!pre.allowed || (!pre.metaPayload && !pre.launch)) {
     return reconcileAction(actionId, { ok: false, error: `preflight: ${pre.reason}` });
   }
   let applied: ApplyResult;
   try {
-    applied = pre.launch ? await runLaunch(actionId) : await applyAbsolutePatch(pre.metaPayload!);
+    applied = pre.launch ? await runLaunch(actionId, ctx) : await applyAbsolutePatch(ctx, pre.metaPayload!);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     await markUncertain(actionId, msg);
@@ -318,7 +384,7 @@ async function runExecute(actionId: string) {
  *  - the ad is created PAUSED — nothing spends until a separate Tier B unpause.
  * The unresolved-writes gate blocks other writes while this action is executing/uncertain.
  */
-async function runLaunch(actionId: string): Promise<ApplyResult> {
+async function runLaunch(actionId: string, ctx: ClientContext): Promise<ApplyResult> {
   const db = getDb();
   const [action] = await db.select().from(adActions).where(eq(adActions.id, actionId)).limit(1);
   const [ad] = await db.select().from(ads).where(eq(ads.id, action.entityId)).limit(1);
@@ -329,9 +395,8 @@ async function runLaunch(actionId: string): Promise<ApplyResult> {
   const [creative] = await db.select().from(creatives).where(eq(creatives.id, ad.creativeId)).limit(1);
   if (!creative) throw new Error("launch: creative not found");
 
-  const pageId = process.env.META_PAGE_ID;
-  if (!pageId) throw new Error("launch: META_PAGE_ID not set");
-  const accountId = process.env.META_AD_ACCOUNT_ID ?? "";
+  const pageId = ctx.pageId;
+  if (!pageId) throw new Error("launch: client has no pageId configured");
   const token = action.idempotencyKey;
   const tagged = `${ad.id} [launch:${token}]`;
   const copy = (ad.copy ?? {}) as { headline?: string; primaryText?: string; description?: string };
@@ -339,9 +404,9 @@ async function runLaunch(actionId: string): Promise<ApplyResult> {
   // Phase 1 — AdCreative (durable: creatives.metaCreativeId)
   let creativeId = creative.metaCreativeId ?? null;
   if (!creativeId) {
-    const found = await findByLaunchToken(accountId, "adcreatives", token);
+    const found = await findByLaunchToken(ctx, "adcreatives", token);
     if (found.length > 1) throw new Error(`launch: ambiguous (${found.length}) creatives for token — manual cleanup`);
-    creativeId = found[0] ?? await createAdCreative(accountId, {
+    creativeId = found[0] ?? await createAdCreative(ctx, {
       name: tagged, pageId, imageUrl: creative.blobUrl, link: ad.destinationUrl,
       message: copy.primaryText, headline: copy.headline, description: copy.description, cta: ad.cta ?? undefined,
     });
@@ -351,9 +416,9 @@ async function runLaunch(actionId: string): Promise<ApplyResult> {
   // Phase 2 — Ad, PAUSED (durable: ads.metaAdId)
   let metaAdId = ad.metaAdId ?? null;
   if (!metaAdId) {
-    const found = await findByLaunchToken(accountId, "ads", token);
+    const found = await findByLaunchToken(ctx, "ads", token);
     if (found.length > 1) throw new Error(`launch: ambiguous (${found.length}) ads for token — manual cleanup`);
-    metaAdId = found[0] ?? await createAdObject(accountId, { name: tagged, adsetId: ad.adsetId, creativeId });
+    metaAdId = found[0] ?? await createAdObject(ctx, { name: tagged, adsetId: ad.adsetId, creativeId });
     await db.update(ads).set({ metaAdId, status: "paused" }).where(eq(ads.id, ad.id));
   }
 
@@ -367,12 +432,14 @@ const BUDGET_TYPES = new Set<ActionType>(["set_budget", "decrease_budget", "incr
 
 /** Re-check guardrails at execution time and build the absolute write payload. This is the
  *  ONLY gate before a Meta write, so it is deliberately strict and self-contained. */
-export async function preflightAction(actionId: string): Promise<Preflight> {
+export async function preflightAction(actionId: string, ctx?: ClientContext): Promise<Preflight> {
   const db = getDb();
   const [action] = await db.select().from(adActions).where(eq(adActions.id, actionId)).limit(1);
   if (!action) return { allowed: false, reason: "not_found" };
   if (action.status !== "approved" && action.status !== "executing") return { allowed: false, reason: `status_${action.status}` };
   if (new Date(action.expiresAt) < new Date()) return { allowed: false, reason: "expired" };
+  // Build the client's credential context if not supplied by the executor (e.g. direct callers/tests).
+  ctx = ctx ?? (await clientContext(action.clientId));
 
   const actionType = action.actionType as ActionType;
   const target = (action.targetState ?? {}) as Record<string, unknown>;
@@ -392,7 +459,7 @@ export async function preflightAction(actionId: string): Promise<Preflight> {
     const next = target.daily_budget as number;
     if (next <= 0) return { allowed: false, reason: "budget_target_must_be_positive" };
     let current: number | null = null;
-    try { current = await getDailyBudgetCents(action.entityId); } catch { current = null; }
+    try { current = await getDailyBudgetCents(ctx, action.entityId); } catch { current = null; }
     if (current == null) return { allowed: false, reason: "budget_current_unknown" }; // fail closed — can't verify the delta
     deltaCents = next - current;
     deltaPct = current > 0 ? (deltaCents / current) * 100 : 100;
@@ -410,7 +477,7 @@ export async function preflightAction(actionId: string): Promise<Preflight> {
   const isIncrease = BUDGET_TYPES.has(actionType) && deltaCents > 0;
   if (isIncrease || actionType === "unpause") {
     let scan: Awaited<ReturnType<typeof fetchEnabledBudgets>>;
-    try { scan = await fetchEnabledBudgets(); } catch { return { allowed: false, reason: "account_budget_unknown" }; }
+    try { scan = await fetchEnabledBudgets(ctx); } catch { return { allowed: false, reason: "account_budget_unknown" }; }
     // Lifetime budgets have no safe daily-cap equivalent → fail closed rather than under-project.
     if (scan.hasLifetime) return { allowed: false, reason: "lifetime_budget_unsupported" };
     const sumOthers = Object.entries(scan.daily)
@@ -425,13 +492,13 @@ export async function preflightAction(actionId: string): Promise<Preflight> {
       // targets entityId regardless). Ad → 0 (parent budget already in sumOthers); CBO campaign /
       // ABO adset → own daily; paused ABO campaign → its child adsets' daily, summed.
       let info: Awaited<ReturnType<typeof getBudgetInfo>>;
-      try { info = await getBudgetInfo(action.entityId); } catch { return { allowed: false, reason: "account_budget_unknown" }; }
+      try { info = await getBudgetInfo(ctx, action.entityId); } catch { return { allowed: false, reason: "account_budget_unknown" }; }
       if (!info.isBudgetNode) addBack = 0;
       else if (info.lifetimeCents != null) return { allowed: false, reason: "lifetime_budget_unsupported" };
       else if (info.dailyCents != null) addBack = info.dailyCents;
       else {
         let child: Awaited<ReturnType<typeof fetchChildAdsetBudgets>>;
-        try { child = await fetchChildAdsetBudgets(action.entityId); } catch { return { allowed: false, reason: "account_budget_unknown" }; }
+        try { child = await fetchChildAdsetBudgets(ctx, action.entityId); } catch { return { allowed: false, reason: "account_budget_unknown" }; }
         if (child.hasLifetime) return { allowed: false, reason: "lifetime_budget_unsupported" };
         addBack = child.dailyCents;
       }
@@ -444,25 +511,13 @@ export async function preflightAction(actionId: string): Promise<Preflight> {
   // it can't deadlock on itself). A hard `block` always fails closed. A Tier A action must
   // evaluate to `allow` to proceed — if it now needs approval (e.g. its real budget delta exceeds
   // the cap) we block rather than auto-write. Tier B `require_approval` proceeds (human approved).
-  const control = await ensureControl();
-  const fresh = await metricsFresh(control.minMetricFreshnessMinutes);
-  const unresolved = await hasUnresolvedWrites(action.id);
+  const { ctx: gctx } = await buildGuardrailContext(action.clientId, {
+    projectedDailySpendCents,
+    excludeActionId: action.id, // exclude self so this in-flight action can't deadlock its own gate
+  });
   const result = evaluate(
     { actionType, policyVersion: action.policyVersion, dailyBudgetDeltaCents: deltaCents, dailyBudgetDeltaPct: deltaPct },
-    {
-      envWriteMode: ENV_WRITE_MODE,
-      control: {
-        writeMode: control.writeMode as GuardrailContext["control"]["writeMode"],
-        emergencyStop: control.emergencyStop,
-        maxAccountDailySpendCents: control.maxAccountDailySpendCents,
-        maxActionBudgetDeltaCents: control.maxActionBudgetDeltaCents,
-        maxActionBudgetDeltaPct: Number(control.maxActionBudgetDeltaPct),
-        activePolicyVersion: control.activePolicyVersion,
-      },
-      metricsFresh: fresh,
-      unresolvedWrites: unresolved,
-      projectedDailySpendCents,
-    },
+    gctx,
   );
   if (result.decision === "block") return { allowed: false, reason: result.code };
   if (result.decision === "require_approval" && tierOf(actionType) === "A") {
@@ -498,15 +553,17 @@ export async function reconcileAction(
     actionId, attempt: count + 1, metaResponse: outcome.metaResponse ?? null, error: outcome.error ?? null,
   });
   const status = outcome.ok ? "succeeded" : "failed";
-  await db.update(adActions).set({ status }).where(eq(adActions.id, actionId));
-  await audit("executor", `action.${status}`, actionId, outcome.metaResponse ?? null, outcome.error ?? null);
+  const [row] = await db.update(adActions).set({ status })
+    .where(eq(adActions.id, actionId)).returning({ clientId: adActions.clientId });
+  if (row) await audit(row.clientId, "executor", `action.${status}`, actionId, outcome.metaResponse ?? null, outcome.error ?? null);
   return { status };
 }
 
 /** Post-write timeout: don't retry blindly — mark uncertain for reconciliation. */
 export async function markUncertain(actionId: string, error: string) {
-  await getDb().update(adActions).set({ status: "uncertain" }).where(eq(adActions.id, actionId));
-  await audit("executor", "action.uncertain", actionId, null, error);
+  const [row] = await getDb().update(adActions).set({ status: "uncertain" })
+    .where(eq(adActions.id, actionId)).returning({ clientId: adActions.clientId });
+  if (row) await audit(row.clientId, "executor", "action.uncertain", actionId, null, error);
 }
 
 /**
@@ -521,8 +578,8 @@ export async function recoverOrphanedWrites(): Promise<{ recovered: number }> {
   const rows = await getDb().update(adActions)
     .set({ status: "uncertain" })
     .where(eq(adActions.status, "executing"))
-    .returning({ id: adActions.id });
-  for (const r of rows) await audit("executor", "action.uncertain", r.id, null, "recovered: process restart mid-write");
+    .returning({ id: adActions.id, clientId: adActions.clientId });
+  for (const r of rows) await audit(r.clientId, "executor", "action.uncertain", r.id, null, "recovered: process restart mid-write");
   if (rows.length) console.warn(`[recovery] demoted ${rows.length} orphaned executing write(s) to uncertain`);
   return { recovered: rows.length };
 }

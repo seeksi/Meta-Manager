@@ -24,10 +24,28 @@
     "appId": "com.metaadsmanager.desktop",
     "productName": "Meta Ads Manager",
     "asar": false,
-    "directories": { "output": "release", "buildResources": "build" },
-    "files": ["electron/**/*", "package.json", "!node_modules/**/*"],
-    "extraResources": [{ "from": ".next/standalone", "to": "standalone" }],
-    "linux": { "target": ["AppImage"], "icon": "build/icon.png", "category": "Office" }
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**/*",
+      "package.json",
+      "!node_modules/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": ".next/standalone",
+        "to": "standalone"
+      }
+    ],
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "icon": "build/icon.png",
+      "category": "Office"
+    }
   },
   "dependencies": {
     "@vercel/blob": "^2.4.1",
@@ -40,6 +58,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.3",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/pg": "^8.11.10",

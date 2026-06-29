@@ -1,7 +1,7 @@
 // Module 7 — Competitor creative research. docs/PRODUCT_SPEC.md §7.
 // Stores creatives from the Meta Ad Library / scraping actors; surfaces long-runners and
 // reusable pattern tags. Use for inspiration, not copying.
-import { eq, desc } from "drizzle-orm";
+import { eq, desc, and } from "drizzle-orm";
 import { getDb } from "@/db";
 import { competitorCreatives } from "@/db/schema";
 
@@ -26,16 +26,17 @@ function daysSince(date?: string): number | null {
  * API or an Apify actor (wired via the meta-creatives-research workflow / Apify MCP).
  * ponytail: actor call is out-of-band; this persists + dedups by adArchiveId.
  */
-export async function ingestCompetitors(items: CompetitorInput[]) {
+export async function ingestCompetitors(clientId: string, items: CompetitorInput[]) {
   const db = getDb();
   let added = 0;
   for (const it of items) {
     if (it.adArchiveId) {
       const existing = await db.select().from(competitorCreatives)
-        .where(eq(competitorCreatives.adArchiveId, it.adArchiveId)).limit(1);
+        .where(and(eq(competitorCreatives.clientId, clientId), eq(competitorCreatives.adArchiveId, it.adArchiveId))).limit(1);
       if (existing[0]) continue;
     }
     await db.insert(competitorCreatives).values({
+      clientId,
       advertiser: it.advertiser,
       adArchiveId: it.adArchiveId ?? null,
       body: it.body ?? null,
@@ -49,8 +50,9 @@ export async function ingestCompetitors(items: CompetitorInput[]) {
   return { added };
 }
 
-export async function listCompetitors() {
+export async function listCompetitors(clientId: string) {
   const rows = await getDb().select().from(competitorCreatives)
+    .where(eq(competitorCreatives.clientId, clientId))
     .orderBy(desc(competitorCreatives.daysRunning));
   return rows.map((r) => ({ ...r, longRunner: (r.daysRunning ?? 0) >= LONG_RUNNER_DAYS }));
 }

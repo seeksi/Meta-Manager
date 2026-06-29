@@ -131,6 +131,29 @@ describe("guardrails.evaluate — default-deny safety", () => {
   });
 });
 
+// M1: the engine is pure and unchanged; per-client isolation is achieved by feeding it a
+// per-client context (built impurely in automation.buildGuardrailContext, covered end-to-end in
+// client-isolation.test.ts). These cases prove the COMPOSITION the context layer relies on.
+describe("guardrails.evaluate — per-client context composition (M1)", () => {
+  it("two clients' contexts evaluate independently (B killed, A not)", () => {
+    const aCtx = ctx({ control: { ...baseControl, emergencyStop: false } });
+    const bCtx = ctx({ control: { ...baseControl, emergencyStop: true } });
+    const act = action({ actionType: "pause_campaign" });
+    expect(evaluate(act, aCtx).decision).toBe("allow");
+    expect(evaluate(act, bCtx).code).toBe("KILL_SWITCH");
+  });
+
+  it("effective kill = agency OR client: agency-on blocks even when the client's own kill is off", () => {
+    // buildGuardrailContext sets control.emergencyStop = agency.emergencyStop || client.emergencyStop.
+    const agencyOn = true, clientOff = false;
+    const combined = ctx({ control: { ...baseControl, emergencyStop: agencyOn || clientOff } });
+    expect(evaluate(action(), combined).code).toBe("KILL_SWITCH");
+    // both off → not killed (reaches normal evaluation)
+    const bothOff = ctx({ control: { ...baseControl, emergencyStop: false || false } });
+    expect(evaluate(action({ dailyBudgetDeltaCents: 5_00, dailyBudgetDeltaPct: 10 }), bothOff).decision).toBe("allow");
+  });
+});
+
 describe("tierOf", () => {
   it("classifies pause/decrease/set_budget as Tier A", () => {
     expect(tierOf("pause_campaign")).toBe("A");

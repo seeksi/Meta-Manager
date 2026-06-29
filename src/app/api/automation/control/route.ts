@@ -1,13 +1,23 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { getControl, ensureControl, setControl } from "@/lib/automation";
+import {
+  getControl, ensureControl, setControl,
+  getAgencyControl, ensureAgencyControl, setAgencyControl,
+} from "@/lib/automation";
+import { isInvalidClientIdError, resolveClientId } from "@/lib/clients";
 
-export async function GET() {
+export async function GET(req: Request) {
   try {
-    const control = (await getControl()) ?? (await ensureControl());
+    if (new URL(req.url).searchParams.get("scope") === "agency") {
+      const control = (await getAgencyControl()) ?? (await ensureAgencyControl());
+      return NextResponse.json({ control });
+    }
+    const clientId = resolveClientId(req);
+    const control = (await getControl(clientId)) ?? (await ensureControl(clientId));
     return NextResponse.json({ control });
   } catch (e) {
     console.error("[control] GET failed:", e);
+    if (isInvalidClientIdError(e)) return NextResponse.json({ error: e.message }, { status: 400 });
     return NextResponse.json({ error: "internal error" }, { status: 503 });
   }
 }
@@ -28,16 +38,21 @@ const PatchSchema = z
   })
   .strict();
 
+const AgencyPatchSchema = z.object({ emergencyStop: z.boolean() }).strict();
+
 export async function PATCH(req: Request) {
-  const parsed = PatchSchema.safeParse(await req.json().catch(() => null));
-  if (!parsed.success) {
-    return NextResponse.json({ error: "Invalid control patch", issues: parsed.error.issues }, { status: 400 });
-  }
+  const body = await req.json().catch(() => null);
+  const agencyScope = new URL(req.url).searchParams.get("scope") === "agency";
+  const parsed = (agencyScope ? AgencyPatchSchema : PatchSchema).safeParse(body);
+  if (!parsed.success) return NextResponse.json({ error: "Invalid control patch", issues: parsed.error.issues }, { status: 400 });
   try {
-    const control = await setControl(parsed.data);
+    const control = agencyScope
+      ? await setAgencyControl({ emergencyStop: parsed.data.emergencyStop })
+      : await setControl(resolveClientId(req), parsed.data);
     return NextResponse.json({ control });
   } catch (e) {
     console.error("[control] PATCH failed:", e);
+    if (isInvalidClientIdError(e)) return NextResponse.json({ error: e.message }, { status: 400 });
     return NextResponse.json({ error: "internal error" }, { status: 503 });
   }
 }

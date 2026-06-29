@@ -6,7 +6,7 @@
 // Safety at this trust boundary: callers must pass an allowlisted key set; values must
 // be single-line (prevents .env injection); secrets are never read back to the client
 // (only presence is exposed). The file is written 0600.
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, chmodSync } from "node:fs";
 import path from "node:path";
 
 // ponytail: writes to <cwd>/.env — correct for dev / from-source runs (cwd = project root).
@@ -42,6 +42,7 @@ export function writeEnvKeys(updates: EnvUpdates): string[] {
 
   const out = lines.join("\n").replace(/\n*$/, "\n");
   writeFileSync(file, out, { mode: 0o600 });
+  chmodSync(file, 0o600);
   return written;
 }
 
