@@ -1,10 +1,10 @@
 // Settings → Setup: read presence / save Meta credential keys to .env. Local desktop,
-// single operator, localhost only — no auth layer. ponytail: if this server is ever
-// exposed beyond loopback, gate this route with an operator token.
+// single operator, localhost only — no auth layer. Hosted deploys set HOSTED=1 to
+// disable writes here; ponytail: G4 adds full operator auth before broad exposure.
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { AGENCY_TOKEN_ENV } from "@/lib/clients";
-import { writeEnvKeys, envPresence } from "@/lib/env-file";
+import { envPresence, envWritesAllowed, writeEnvKeys } from "@/lib/env-file";
 
 export const dynamic = "force-dynamic";
 
@@ -21,10 +21,16 @@ const Body = z
   .strict();
 
 export function GET() {
-  return NextResponse.json({ present: envPresence(KEYS) });
+  return NextResponse.json({ present: envPresence(KEYS), editable: envWritesAllowed() });
 }
 
 export async function POST(req: Request) {
+  if (!envWritesAllowed()) {
+    return NextResponse.json(
+      { ok: false, error: "env writes disabled on hosted deploy; set secrets via the host secret store" },
+      { status: 403 },
+    );
+  }
   const parsed = Body.safeParse(await req.json().catch(() => null));
   if (!parsed.success) {
     return NextResponse.json({ ok: false, error: "Invalid payload" }, { status: 400 });

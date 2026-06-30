@@ -1,6 +1,9 @@
-// Local background scheduler — the desktop replacement for Inngest. Runs in-process while
-// the app is open (single instance), so there is no durable cloud cron. docs/ARCHITECTURE.md §3.
+// Local background scheduler. Runs in-process in the hosted/desktop Node server; the run ledger
+// makes daily optimize catch-up restart-safe for this single instance.
 // The native Meta account spend cap remains the external 24/7 backstop.
+import { and, desc, eq } from "drizzle-orm";
+import { getDb } from "@/db";
+import { schedulerRuns } from "@/db/schema";
 import { fetchInsights } from "@/lib/meta/client";
 import { ingestInsights } from "@/lib/metrics";
 import { runOptimization } from "@/lib/optimizer";
@@ -27,6 +30,40 @@ export function getSchedulerStatus(): SchedulerStatus {
   return { ...status };
 }
 
+type SchedulerJob = "optimize" | "poll" | (string & {});
+
+export async function recordRunStart(job: SchedulerJob, clientId: string | null): Promise<string> {
+  const [row] = await getDb()
+    .insert(schedulerRuns)
+    .values({ job, clientId, startedAt: new Date() })
+    .returning({ id: schedulerRuns.id });
+  return row.id;
+}
+
+export async function recordRunFinish(runId: string, ok: boolean, result: unknown): Promise<void> {
+  await getDb()
+    .update(schedulerRuns)
+    .set({ finishedAt: new Date(), ok, result })
+    .where(eq(schedulerRuns.id, runId));
+}
+
+export async function lastSuccessfulRunAt(job: SchedulerJob): Promise<Date | null> {
+  const [row] = await getDb()
+    .select({ startedAt: schedulerRuns.startedAt })
+    .from(schedulerRuns)
+    .where(and(eq(schedulerRuns.job, job), eq(schedulerRuns.ok, true)))
+    .orderBy(desc(schedulerRuns.startedAt))
+    .limit(1);
+  return row?.startedAt ?? null;
+}
+
+export function dueForOptimize(lastSuccessAt: Date | null, now: Date, optimizeHour: number): boolean {
+  const target = new Date(now);
+  target.setHours(optimizeHour, 0, 0, 0);
+  if (now < target) return false;
+  return lastSuccessAt === null || lastSuccessAt < target;
+}
+
 /** Poll campaign insights for today and ingest, PER active client. Raw — see runPoll for the
  *  status-tracked wrapper. One client's failure must not abort the others. */
 async function pollInsightsOnce() {
@@ -47,6 +84,7 @@ async function pollInsightsOnce() {
 
 /** Status-tracked insights poll. Exported for the "Poll now" button. Throws on error. */
 export async function runPoll() {
+  // ponytail: poll run ledger needs a prune policy first; optimize is the only durable G2 job.
   status.busy = "poll";
   try {
     const result = await pollInsightsOnce();
@@ -61,6 +99,7 @@ export async function runPoll() {
 /** Status-tracked optimizer run across ALL active clients. Exported for the "Run optimizer now"
  *  button. One client's failure must not abort the others. */
 export async function runOptimize() {
+  const runId = await recordRunStart("optimize", null);
   status.busy = "optimize";
   try {
     const clients = await listActiveClients();
@@ -72,11 +111,25 @@ export async function runOptimize() {
         perClient[c.id] = { error: e instanceof Error ? e.message : String(e) };
       }
     }
+    const result = { clients: clients.length, perClient };
     status.lastOptimizeAt = new Date().toISOString();
-    return { clients: clients.length, perClient };
+    await recordRunFinish(runId, true, result);
+    return result;
+  } catch (e) {
+    await recordRunFinish(runId, false, { error: e instanceof Error ? e.message : String(e) });
+    throw e;
   } finally {
     status.busy = null;
   }
+}
+
+export async function maybeRunOptimize() {
+  const last = await lastSuccessfulRunAt("optimize");
+  if (!dueForOptimize(last, new Date(), OPTIMIZE_HOUR)) {
+    console.log("[scheduler] optimize skipped — already ran for today's window");
+    return { skipped: "not due", lastSuccessAt: last?.toISOString() ?? null };
+  }
+  return runOptimize();
 }
 
 async function safe(label: string, fn: () => Promise<unknown>) {
@@ -95,21 +148,31 @@ function msUntilHour(hour: number) {
   return next.getTime() - now.getTime();
 }
 
+export async function schedulerTick() {
+  await safe("poll-insights", runPoll);
+  await safe("recover-orphans", recoverOrphanedWrites);
+}
+
 /** Idempotent: starts insights polling + the daily optimizer. Called once from instrumentation. */
 export function startScheduler() {
   if (status.started) return;
   status.started = true;
   console.log(`[scheduler] started — insights every ${POLL_MS / 60_000}m, optimizer daily at ${OPTIMIZE_HOUR}:00`);
 
+  // ponytail: a real durable queue (QStash/Inngest) is only needed at Option-2/multi-instance scale.
+  void lastSuccessfulRunAt("optimize").then((last) => {
+    if (last) status.lastOptimizeAt = last.toISOString();
+  }).catch((e) => console.error("[scheduler] hydrate optimize status failed:", e instanceof Error ? e.message : e));
   void safe("recover-orphans", recoverOrphanedWrites); // resolve writes left in-flight by a crash
   void safe("poll-insights", runPoll); // fresh data on launch
-  setInterval(() => void safe("poll-insights", runPoll), POLL_MS);
+  void safe("optimize-catch-up", maybeRunOptimize); // re-fire if today's 09:00 was missed
+  setInterval(() => void schedulerTick(), POLL_MS);
 
   const armOptimize = () => {
     const ms = msUntilHour(OPTIMIZE_HOUR);
     status.nextOptimizeAt = new Date(Date.now() + ms).toISOString();
     setTimeout(() => {
-      void safe("optimize", runOptimize);
+      void safe("optimize", maybeRunOptimize);
       armOptimize(); // re-arm for the next day
     }, ms);
   };

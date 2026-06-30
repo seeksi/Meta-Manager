@@ -1,8 +1,8 @@
 // Client registry + per-call credential context. After M1 this is the ONLY place env Meta
 // credentials are read; per-client lib/route threading lands in G2/G3.
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { getDb } from "@/db";
-import { clients } from "@/db/schema";
+import { clients, operators } from "@/db/schema";
 
 export { clients };
 export type Client = typeof clients.$inferSelect;
@@ -11,12 +11,24 @@ export type Client = typeof clients.$inferSelect;
 // operational row to this client. SQL can't read env, so 0007 seeds placeholder creds and
 // ensureBootstrapClient() upserts the real META_* values from env at app boot.
 export const BOOTSTRAP_CLIENT_ID = "00000000-0000-0000-0000-000000000001";
+export const BOOTSTRAP_OPERATOR_ID = "00000000-0000-0000-0000-000000000010";
 
-// ponytail: host secret manager in WS-3 (Vercel/secret store); env var for now.
+// Resolved for hosted G1: production secrets come from host-injected env/secret stores
+// (Fly/Render/Railway/VPS). The writable .env path is local-dev/desktop only.
+// ponytail: optional Vault/SSM adapter if plain host env stops being enough.
 export const AGENCY_TOKEN_ENV = "META_SYSTEM_USER_TOKEN";
 /** The single agency System User token (Model A). Sole reader of the token env var. */
 export function agencyToken(): string {
   return process.env[AGENCY_TOKEN_ENV]?.trim() ?? "";
+}
+
+export async function ensureBootstrapOperator(): Promise<void> {
+  const username = process.env.OPERATOR_USERNAME?.trim() || "operator";
+  await getDb()
+    .insert(operators)
+    .values({ id: BOOTSTRAP_OPERATOR_ID, username })
+    .onConflictDoUpdate({ target: operators.id, set: { username } });
+  await getDb().update(clients).set({ ownerId: BOOTSTRAP_OPERATOR_ID }).where(isNull(clients.ownerId));
 }
 
 // Pinned Marketing API version. Sourced here because clients.ts is the sole env boundary after
@@ -72,7 +84,9 @@ export function optionalClientIdFromSearchParams(searchParams: URLSearchParams):
 
 /** Active client for a request: `?clientId=` (or `x-client-id` header), validated as a uuid,
  *  defaulting to the bootstrap client for back-compat with the single existing account.
- *  ponytail: single-operator default; per-operator client ownership/auth is WS-3. */
+ *  Ownership is enforced by session operator + clientOwnedBy at client-PK boundaries.
+ *  ponytail: broader per-sub-resource IDOR, multi-operator filtering, and RBAC land when a
+ *  second operator exists; single-operator owns all current clients. */
 export function resolveClientId(req: Request): string {
   const fromQuery = new URL(req.url).searchParams.get("clientId");
   if (fromQuery !== null) return validateClientId(fromQuery);
@@ -84,6 +98,30 @@ export function resolveClientId(req: Request): string {
 export async function getClient(id: string): Promise<Client | undefined> {
   const rows = await getDb().select().from(clients).where(eq(clients.id, id)).limit(1);
   return rows[0];
+}
+
+export class ClientNotOwnedError extends Error {
+  constructor() {
+    super("client is not owned by this operator");
+    this.name = "ClientNotOwnedError";
+  }
+}
+
+export function isClientNotOwnedError(e: unknown): e is ClientNotOwnedError {
+  return e instanceof ClientNotOwnedError;
+}
+
+export async function clientOwnedBy(operatorId: string, clientId: string): Promise<boolean> {
+  const rows = await getDb()
+    .select({ id: clients.id })
+    .from(clients)
+    .where(and(eq(clients.id, clientId), eq(clients.ownerId, operatorId)))
+    .limit(1);
+  return rows.length > 0;
+}
+
+export async function assertClientOwnedBy(operatorId: string, clientId: string): Promise<void> {
+  if (!(await clientOwnedBy(operatorId, clientId))) throw new ClientNotOwnedError();
 }
 
 export async function listActiveClients(): Promise<Client[]> {

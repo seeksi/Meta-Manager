@@ -2,7 +2,7 @@ import { eq } from "drizzle-orm";
 import { getDb } from "@/db";
 import { auditEvents, clients } from "@/db/schema";
 import { ensureControl, setControl } from "@/lib/automation";
-import { clientContext, getClient, validateClientId, type Client } from "@/lib/clients";
+import { BOOTSTRAP_OPERATOR_ID, clientContext, getClient, validateClientId, type Client } from "@/lib/clients";
 import { verifyAccess, verifyNode, type AccountInfo } from "@/lib/meta/client";
 
 export async function createClient(input: {
@@ -10,10 +10,12 @@ export async function createClient(input: {
   metaAccountId: string;
   pageId?: string | null;
   pixelId?: string | null;
+  ownerId?: string;
 }): Promise<Client> {
   const [client] = await getDb()
     .insert(clients)
     .values({
+      ownerId: input.ownerId ?? BOOTSTRAP_OPERATOR_ID,
       name: input.name,
       metaAccountId: input.metaAccountId,
       pageId: input.pageId ?? null,

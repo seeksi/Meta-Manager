@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { getDb } from "@/db";
 import { automationControl, clients } from "@/db/schema";
+import { operatorIdFromRequest } from "@/lib/auth";
 import { createClient } from "@/lib/onboarding";
 
 export const dynamic = "force-dynamic";
@@ -19,7 +20,9 @@ const ClientCreateSchema = z
   })
   .strict();
 
-export async function GET() {
+export async function GET(req: Request) {
+  const operatorId = await operatorIdFromRequest(req);
+  if (!operatorId) return NextResponse.json({ error: "unauthenticated" }, { status: 401 });
   const rows = await getDb()
     .select({
       id: clients.id,
@@ -32,15 +35,18 @@ export async function GET() {
       writeMode: automationControl.writeMode,
     })
     .from(clients)
-    .leftJoin(automationControl, eq(automationControl.clientId, clients.id));
+    .leftJoin(automationControl, eq(automationControl.clientId, clients.id))
+    .where(eq(clients.ownerId, operatorId));
 
   return NextResponse.json({ clients: rows });
 }
 
 export async function POST(req: Request) {
+  const operatorId = await operatorIdFromRequest(req);
+  if (!operatorId) return NextResponse.json({ error: "unauthenticated" }, { status: 401 });
   const body = await req.json().catch(() => null);
   const parsed = ClientCreateSchema.safeParse(body);
   if (!parsed.success) return NextResponse.json({ ok: false, error: parsed.error }, { status: 400 });
-  const client = await createClient(parsed.data);
+  const client = await createClient({ ...parsed.data, ownerId: operatorId });
   return NextResponse.json({ ok: true, client }, { status: 201 });
 }
