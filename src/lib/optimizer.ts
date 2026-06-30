@@ -2,16 +2,17 @@
 // emits proposed actions into the guardrail/approval pipeline. Rules informed by the Claude
 // Council consult (see docs/ARCHITECTURE.md note). Stance: auto-pause obvious losers,
 // auto-cut cautiously, NEVER auto-scale (growth is Tier B). The executor still does all writes.
-import { desc, gte, eq } from "drizzle-orm";
+import { desc, gte, eq, and } from "drizzle-orm";
 import { getDb } from "@/db";
 import { metaInsightsDaily, adActions } from "@/db/schema";
 import { proposeAction, ensureControl } from "./automation";
+import { getClient, activeClientContext } from "@/lib/clients";
 import { getDailyBudgetCents } from "@/lib/meta/client";
 
-/** Recent optimizer-originated proposals for the recommendations UI. */
-export async function listProposals(limit = 50) {
+/** Recent optimizer-originated proposals for the recommendations UI, scoped to one client. */
+export async function listProposals(clientId: string, limit = 50) {
   return getDb().select().from(adActions)
-    .where(eq(adActions.entityType, "campaign"))
+    .where(and(eq(adActions.clientId, clientId), eq(adActions.entityType, "campaign")))
     .orderBy(desc(adActions.createdAt)).limit(limit);
 }
 
@@ -126,10 +127,14 @@ function buildEvidence(p: Proposal, cfg: OptimizerConfig, windowStart: string, w
   };
 }
 
-export async function runOptimization(override: Partial<OptimizerConfig> = {}) {
+export async function runOptimization(clientId: string, override: Partial<OptimizerConfig> = {}) {
   const db = getDb();
-  // Targets come from the editable automation_control row; rest from defaults.
-  const control = await ensureControl();
+  const client = await getClient(clientId);
+  if (!client) throw new Error(`unknown client: ${clientId}`);
+  const accountId = client.metaAccountId;
+  const ctx = await activeClientContext(clientId);
+  // Targets come from THIS client's automation_control row; rest from defaults.
+  const control = await ensureControl(clientId);
   const cfg: OptimizerConfig = {
     ...DEFAULT_CONFIG,
     targetCpaCents: control.targetCpaCents,
@@ -137,14 +142,16 @@ export async function runOptimization(override: Partial<OptimizerConfig> = {}) {
     ...override,
   };
   const [latest] = await db.select({ day: metaInsightsDaily.dateStart })
-    .from(metaInsightsDaily).orderBy(desc(metaInsightsDaily.dateStart)).limit(1);
+    .from(metaInsightsDaily).where(eq(metaInsightsDaily.metaAccountId, accountId))
+    .orderBy(desc(metaInsightsDaily.dateStart)).limit(1);
   if (!latest) return { ran: true, proposals: 0, note: "no metrics yet" };
 
   const start = new Date(new Date(latest.day).getTime() - (cfg.windowDays - 1) * 86_400_000)
     .toISOString().slice(0, 10);
 
-  // Aggregate the window per campaign.
-  const rows = (await db.select().from(metaInsightsDaily).where(gte(metaInsightsDaily.dateStart, start)))
+  // Aggregate the window per campaign — scoped to this client's ad account.
+  const rows = (await db.select().from(metaInsightsDaily)
+    .where(and(eq(metaInsightsDaily.metaAccountId, accountId), gte(metaInsightsDaily.dateStart, start))))
     .filter((r) => r.entityType === "campaign");
   const byEntity = new Map<string, Agg>();
   for (const r of rows) {
@@ -160,7 +167,8 @@ export async function runOptimization(override: Partial<OptimizerConfig> = {}) {
   // Anti-thrash cooldown.
   const since = new Date(Date.now() - cfg.cooldownHours * 3600_000);
   const acted = new Set(
-    (await db.select({ entityId: adActions.entityId }).from(adActions).where(gte(adActions.createdAt, since)))
+    (await db.select({ entityId: adActions.entityId }).from(adActions)
+      .where(and(eq(adActions.clientId, clientId), gte(adActions.createdAt, since))))
       .map((r) => r.entityId),
   );
 
@@ -171,16 +179,26 @@ export async function runOptimization(override: Partial<OptimizerConfig> = {}) {
     .sort((x, y) => y.agg.spendCents - x.agg.spendCents)
     .slice(0, cfg.maxProposalsPerRun);
 
+  // Account's most-recent-day actual spend = baseline for projecting post-change account spend,
+  // which the account-daily-spend-cap guardrail checks. (Spend ≈ budget for a campaign that
+  // spends to budget; +delta is a sound conservative projection.)
+  const day = String(latest.day).slice(0, 10);
+  const accountDailySpendCents = rows
+    .filter((r) => String(r.dateStart).slice(0, 10) === day)
+    .reduce((s, r) => s + r.spendCents, 0);
+
   const minViableBudgetCents = Math.max(20_00, 2 * cfg.targetCpaCents); // don't starve to nothing
   let created = 0;
   for (const p of proposals) {
     let targetState: Record<string, unknown>;
+    let deltaCents = 0; // signed: +increase / -decrease; 0 for pause (status change)
+    let deltaPct = 0;   // relative to current daily budget
     if (p.actionType === "pause_campaign") {
       targetState = { status: "PAUSED" };
     } else {
       // Budget change → absolute target from current budget. Needs Meta read.
       let current: number | null = null;
-      try { current = await getDailyBudgetCents(p.agg.entityId); } catch { current = null; }
+      try { current = await getDailyBudgetCents(ctx, p.agg.entityId); } catch { current = null; }
       if (current == null) continue; // can't change budget safely without the current value
       let next: number;
       if (p.actionType === "decrease_budget") {
@@ -191,12 +209,19 @@ export async function runOptimization(override: Partial<OptimizerConfig> = {}) {
         if (next <= current) continue; // already at cap
       }
       targetState = { daily_budget: next };
+      deltaCents = next - current;
+      deltaPct = current > 0 ? (deltaCents / current) * 100 : 0;
     }
     await proposeAction({
+      clientId,
       actionType: p.actionType,
       entityType: p.agg.entityType,
       entityId: p.agg.entityId,
       targetState,
+      // Deltas drive the per-action + account-cap guardrails (incl. the executor's re-check).
+      dailyBudgetDeltaCents: deltaCents,
+      dailyBudgetDeltaPct: deltaPct,
+      projectedDailySpendCents: accountDailySpendCents + deltaCents,
       evidence: buildEvidence(p, cfg, start, latest.day),
       actor: "optimizer",
       // Deterministic key: dedupes repeat proposals for the same entity+action+rule.

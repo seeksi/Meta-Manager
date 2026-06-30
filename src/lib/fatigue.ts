@@ -1,9 +1,10 @@
 // v2 — Creative fatigue detection. docs/ARCHITECTURE.md §6 (v2). Advisory only: rising
 // frequency and/or declining CTR over a 7-day window signal a creative needs refreshing.
 // Refreshing creative is a human action, so this never emits an auto-write.
-import { desc, gte } from "drizzle-orm";
+import { desc, gte, eq, and } from "drizzle-orm";
 import { getDb } from "@/db";
 import { metaInsightsDaily } from "@/db/schema";
+import { getClient } from "@/lib/clients";
 
 export interface DailyPoint { date: string; impressions: number; reach: number; clicks: number }
 
@@ -54,14 +55,19 @@ export function scoreFatigue(points: DailyPoint[], cfg: FatigueConfig = DEFAULT_
 
 export interface FatigueRow extends FatigueSignal { entityId: string }
 
-export async function detectFatigue(cfg: FatigueConfig = DEFAULT_FATIGUE): Promise<FatigueRow[]> {
+export async function detectFatigue(clientId: string, cfg: FatigueConfig = DEFAULT_FATIGUE): Promise<FatigueRow[]> {
   const db = getDb();
+  const client = await getClient(clientId);
+  if (!client) return [];
+  const accountId = client.metaAccountId;
   const [latest] = await db.select({ day: metaInsightsDaily.dateStart })
-    .from(metaInsightsDaily).orderBy(desc(metaInsightsDaily.dateStart)).limit(1);
+    .from(metaInsightsDaily).where(eq(metaInsightsDaily.metaAccountId, accountId))
+    .orderBy(desc(metaInsightsDaily.dateStart)).limit(1);
   if (!latest) return [];
 
   const start = new Date(new Date(latest.day).getTime() - 6 * 86_400_000).toISOString().slice(0, 10);
-  const rows = await db.select().from(metaInsightsDaily).where(gte(metaInsightsDaily.dateStart, start));
+  const rows = await db.select().from(metaInsightsDaily)
+    .where(and(eq(metaInsightsDaily.metaAccountId, accountId), gte(metaInsightsDaily.dateStart, start)));
 
   const byEntity = new Map<string, DailyPoint[]>();
   for (const r of rows.filter((x) => x.entityType === "campaign")) {

@@ -5,6 +5,19 @@ import {
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
+// ── Clients (the M1 scoping root; credential-context helpers live in lib/clients.ts) ──
+// One row per managed Meta ad account. status: active|paused|archived.
+export const clients = pgTable("clients", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  status: text("status").notNull().default("active"),
+  verifyState: text("verify_state").notNull().default("draft"), // draft → verifying → active | failed
+  metaAccountId: text("meta_account_id").notNull(),
+  pageId: text("page_id"),
+  pixelId: text("pixel_id"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 // ── Metrics (plain Postgres + rollups; partition/BRIN later) ───────────────────
 export const metricFetches = pgTable("metric_fetches", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -67,6 +80,7 @@ export const metaInsightsHourly = pgTable(
 export const metricRollupsDaily = pgTable(
   "metric_rollups_daily",
   {
+    clientId: uuid("client_id").notNull().references(() => clients.id),
     day: date("day").notNull(),
     entityType: text("entity_type").notNull(),
     entityId: text("entity_id").notNull(),
@@ -76,13 +90,25 @@ export const metricRollupsDaily = pgTable(
     ctr: numeric("ctr"),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [uniqueIndex("ux_rollup_daily").on(t.day, t.entityType, t.entityId)],
+  (t) => [
+    // clientId is part of the unique key so per-client rollups never collide.
+    uniqueIndex("ux_rollup_daily").on(t.clientId, t.day, t.entityType, t.entityId),
+    index("ix_rollup_client").on(t.clientId),
+  ],
 );
 
 // ── Autonomy engine (see §5) ───────────────────────────────────────────────────
-// Singleton control row (id always true). write_mode: off|observe|tier_a|all.
+// Global agency master gate, layered ABOVE every per-client control row.
+// effective kill = agency.emergencyStop || client.emergencyStop.
+export const agencyControl = pgTable("agency_control", {
+  id: boolean("id").primaryKey().default(true), // singleton (id always true)
+  emergencyStop: boolean("emergency_stop").notNull().default(true), // master KILL (true = stopped)
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// One control row PER CLIENT. write_mode: off|observe|tier_a|all.
 export const automationControl = pgTable("automation_control", {
-  id: boolean("id").primaryKey().default(true),
+  clientId: uuid("client_id").primaryKey().references(() => clients.id),
   writeMode: text("write_mode").notNull().default("off"),
   emergencyStop: boolean("emergency_stop").notNull().default(true), // KILL SWITCH (true = stopped)
   maxAccountDailySpendCents: integer("max_account_daily_spend_cents").notNull().default(0),
@@ -100,19 +126,24 @@ export const automationControl = pgTable("automation_control", {
 // status: proposed|blocked|pending_approval|approved|executing|succeeded|failed|uncertain
 export const adActions = pgTable("ad_actions", {
   id: uuid("id").primaryKey().defaultRandom(),
+  clientId: uuid("client_id").notNull().references(() => clients.id),
   tier: text("tier").notNull(), // A | B
   status: text("status").notNull().default("proposed"),
   actionType: text("action_type").notNull(),
   entityType: text("entity_type").notNull(),
   entityId: text("entity_id").notNull(),
   targetState: jsonb("target_state").notNull(), // absolute target, never deltas
+  // Persisted so the executor can RE-RUN guardrails at write time (caps depend on these).
+  dailyBudgetDeltaCents: integer("daily_budget_delta_cents").notNull().default(0),
+  dailyBudgetDeltaPct: numeric("daily_budget_delta_pct").notNull().default("0"),
+  projectedDailySpendCents: integer("projected_daily_spend_cents").notNull().default(0),
   evidence: jsonb("evidence"),
   guardrailResult: jsonb("guardrail_result"),
   policyVersion: integer("policy_version").notNull(),
   idempotencyKey: text("idempotency_key").notNull().unique(),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (t) => [index("ix_ad_actions_client").on(t.clientId)]);
 
 export const actionAttempts = pgTable("action_attempts", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -128,6 +159,7 @@ export const auditEvents = pgTable(
   "audit_events",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    clientId: uuid("client_id").references(() => clients.id),
     actor: text("actor").notNull(), // operator | system | optimizer
     eventType: text("event_type").notNull(),
     subjectId: text("subject_id"),
@@ -137,11 +169,12 @@ export const auditEvents = pgTable(
     actionId: uuid("action_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index("ix_audit_created").on(t.createdAt)],
+  (t) => [index("ix_audit_created").on(t.createdAt), index("ix_audit_client").on(t.clientId)],
 );
 
 export const spendReservations = pgTable("spend_reservations", {
   actionId: uuid("action_id").primaryKey().references(() => adActions.id),
+  clientId: uuid("client_id").notNull().references(() => clients.id),
   day: date("day").notNull(),
   deltaDailyBudgetCents: integer("delta_daily_budget_cents").notNull(),
   status: text("status").notNull().default("held"), // held|committed|released
@@ -150,6 +183,7 @@ export const spendReservations = pgTable("spend_reservations", {
 // ── Creatives / ads / leads ─────────────────────────────────────────────────────
 export const creatives = pgTable("creatives", {
   id: uuid("id").primaryKey().defaultRandom(),
+  clientId: uuid("client_id").notNull().references(() => clients.id),
   blobUrl: text("blob_url").notNull(),
   type: text("type").notNull(), // image | video
   hash: text("hash").notNull(),
@@ -160,6 +194,7 @@ export const creatives = pgTable("creatives", {
 
 export const ads = pgTable("ads", {
   id: uuid("id").primaryKey().defaultRandom(),
+  clientId: uuid("client_id").notNull().references(() => clients.id),
   creativeId: uuid("creative_id").references(() => creatives.id),
   copy: jsonb("copy"), // { headline, primaryText, description }
   cta: text("cta"),
@@ -173,6 +208,7 @@ export const ads = pgTable("ads", {
 
 export const leads = pgTable("leads", {
   id: uuid("id").primaryKey().defaultRandom(),
+  clientId: uuid("client_id").notNull().references(() => clients.id),
   source: text("source"),
   campaignId: text("campaign_id"), // attribution: Meta campaign that produced the lead
   stage: text("stage").notNull().default("new"),
@@ -185,6 +221,7 @@ export const leads = pgTable("leads", {
 // ── Competitor research (Meta Ad Library + scraping actors) ─────────────────────
 export const competitorCreatives = pgTable("competitor_creatives", {
   id: uuid("id").primaryKey().defaultRandom(),
+  clientId: uuid("client_id").notNull().references(() => clients.id),
   advertiser: text("advertiser").notNull(),
   adArchiveId: text("ad_archive_id"), // Meta Ad Library id
   body: text("body"),
@@ -199,6 +236,7 @@ export const competitorCreatives = pgTable("competitor_creatives", {
 // ── A/B experiments ─────────────────────────────────────────────────────────────
 export const experiments = pgTable("experiments", {
   id: uuid("id").primaryKey().defaultRandom(),
+  clientId: uuid("client_id").notNull().references(() => clients.id),
   name: text("name").notNull(),
   hypothesis: text("hypothesis"),
   metric: text("metric").notNull().default("cvr"), // cvr = purchases/clicks
@@ -211,6 +249,7 @@ export const experiments = pgTable("experiments", {
 });
 
 export const schema = {
+  clients, agencyControl,
   metricFetches, metaInsightsDaily, metaInsightsHourly, metricRollupsDaily,
   automationControl, adActions, actionAttempts, auditEvents, spendReservations,
   creatives, ads, leads, competitorCreatives, experiments,

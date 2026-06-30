@@ -5,6 +5,7 @@ import { fetchInsights } from "@/lib/meta/client";
 import { ingestInsights } from "@/lib/metrics";
 import { runOptimization } from "@/lib/optimizer";
 import { recoverOrphanedWrites } from "@/lib/automation";
+import { listActiveClients, clientContext } from "@/lib/clients";
 
 const POLL_MS = 15 * 60_000; // insights poll cadence (matches the old */15 cron)
 const OPTIMIZE_HOUR = 9;     // daily optimizer, local time (matches the old 0 9 * * *)
@@ -26,12 +27,22 @@ export function getSchedulerStatus(): SchedulerStatus {
   return { ...status };
 }
 
-/** Poll campaign insights for today and ingest. Raw — see runPoll for the status-tracked wrapper. */
+/** Poll campaign insights for today and ingest, PER active client. Raw — see runPoll for the
+ *  status-tracked wrapper. One client's failure must not abort the others. */
 async function pollInsightsOnce() {
-  const accountId = process.env.META_AD_ACCOUNT_ID;
-  if (!accountId) return { skipped: "no META_AD_ACCOUNT_ID" };
-  const rows = await fetchInsights({ level: "campaign", accountId, since: "today", until: "today" });
-  return { fetched: rows.length, ...(await ingestInsights(accountId, rows)) };
+  const clients = await listActiveClients();
+  if (clients.length === 0) return { skipped: "no active clients" };
+  const perClient: Record<string, unknown> = {};
+  for (const c of clients) {
+    try {
+      const ctx = await clientContext(c.id);
+      const rows = await fetchInsights(ctx, { level: "campaign", since: "today", until: "today" });
+      perClient[c.id] = { fetched: rows.length, ...(await ingestInsights(c.id, c.metaAccountId, rows)) };
+    } catch (e) {
+      perClient[c.id] = { error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+  return { clients: clients.length, perClient };
 }
 
 /** Status-tracked insights poll. Exported for the "Poll now" button. Throws on error. */
@@ -47,13 +58,22 @@ export async function runPoll() {
   }
 }
 
-/** Status-tracked optimizer run. Exported for the "Run optimizer now" button. Throws on error. */
+/** Status-tracked optimizer run across ALL active clients. Exported for the "Run optimizer now"
+ *  button. One client's failure must not abort the others. */
 export async function runOptimize() {
   status.busy = "optimize";
   try {
-    const result = await runOptimization();
+    const clients = await listActiveClients();
+    const perClient: Record<string, unknown> = {};
+    for (const c of clients) {
+      try {
+        perClient[c.id] = await runOptimization(c.id);
+      } catch (e) {
+        perClient[c.id] = { error: e instanceof Error ? e.message : String(e) };
+      }
+    }
     status.lastOptimizeAt = new Date().toISOString();
-    return result;
+    return { clients: clients.length, perClient };
   } finally {
     status.busy = null;
   }

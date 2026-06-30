@@ -1,9 +1,12 @@
 import { listAudit } from "@/lib/automation";
+import { isInvalidClientIdError, optionalClientIdFromSearchParams } from "@/lib/clients";
 import { toCsv } from "@/lib/csv";
 
-export async function GET() {
+// Agency-wide audit export by default (deliberate cross-client read). Pass `?clientId=` to scope.
+export async function GET(req: Request) {
   try {
-    const events = await listAudit(1000);
+    const clientId = optionalClientIdFromSearchParams(new URL(req.url).searchParams);
+    const events = await listAudit(clientId, 1000);
     const csv = toCsv(
       ["created_at", "actor", "event_type", "subject_id", "reason"],
       events.map((e) => [
@@ -17,6 +20,7 @@ export async function GET() {
       },
     });
   } catch (e) {
+    if (isInvalidClientIdError(e)) return new Response(e.message, { status: 400 });
     return new Response(String(e), { status: 503 });
   }
 }

@@ -6,6 +6,7 @@ import { ResolveActions } from "@/components/resolve-actions";
 import { ControlEditor } from "@/components/control-editor";
 import { SchedulerPanel } from "@/components/scheduler-panel";
 import { listQueue, listUnresolved, listAudit } from "@/lib/automation";
+import { BOOTSTRAP_CLIENT_ID } from "@/lib/clients";
 
 export const dynamic = "force-dynamic";
 
@@ -15,7 +16,10 @@ export default async function AutomationPage() {
   let audit: Awaited<ReturnType<typeof listAudit>> = [];
   let dbError: string | null = null;
   try {
-    [queue, unresolved, audit] = await Promise.all([listQueue(), listUnresolved(), listAudit()]);
+    // ponytail: default to the bootstrap client until a client switcher (post-M2 onboarding) lands.
+    [queue, unresolved, audit] = await Promise.all([
+      listQueue(BOOTSTRAP_CLIENT_ID), listUnresolved(BOOTSTRAP_CLIENT_ID), listAudit(BOOTSTRAP_CLIENT_ID),
+    ]);
   } catch (e) {
     dbError = e instanceof Error ? e.message : String(e);
   }

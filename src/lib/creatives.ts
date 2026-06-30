@@ -2,17 +2,19 @@
 // Uploads go to Vercel Blob with sha256 dedup. Launch routes through proposeAction (Tier B).
 import { put } from "@vercel/blob";
 import { createHash } from "node:crypto";
-import { eq, desc } from "drizzle-orm";
+import { eq, desc, and } from "drizzle-orm";
 import { getDb } from "@/db";
 import { creatives, ads } from "@/db/schema";
 import { proposeAction } from "./automation";
 
-export async function uploadCreative(file: { name: string; bytes: Buffer; contentType: string }) {
+export async function uploadCreative(clientId: string, file: { name: string; bytes: Buffer; contentType: string }) {
   const type = file.contentType.startsWith("video") ? "video" : "image";
   const hash = createHash("sha256").update(file.bytes).digest("hex");
   const db = getDb();
 
-  const existing = await db.select().from(creatives).where(eq(creatives.hash, hash)).limit(1);
+  // Dedup within the client's library.
+  const existing = await db.select().from(creatives)
+    .where(and(eq(creatives.clientId, clientId), eq(creatives.hash, hash))).limit(1);
   if (existing[0]) return { creative: existing[0], deduped: true };
 
   const blob = await put(`creatives/${hash}-${file.name}`, file.bytes, {
@@ -20,12 +22,13 @@ export async function uploadCreative(file: { name: string; bytes: Buffer; conten
     contentType: file.contentType,
   });
   const [row] = await db.insert(creatives)
-    .values({ blobUrl: blob.url, type, hash }).returning();
+    .values({ clientId, blobUrl: blob.url, type, hash }).returning();
   return { creative: row, deduped: false };
 }
 
-export async function listCreatives() {
-  return getDb().select().from(creatives).orderBy(desc(creatives.createdAt));
+export async function listCreatives(clientId: string) {
+  return getDb().select().from(creatives)
+    .where(eq(creatives.clientId, clientId)).orderBy(desc(creatives.createdAt));
 }
 
 export interface AdInput {
@@ -38,9 +41,10 @@ export interface AdInput {
   launch?: boolean;
 }
 
-export async function createAd(input: AdInput) {
+export async function createAd(clientId: string, input: AdInput) {
   const db = getDb();
   const [ad] = await db.insert(ads).values({
+    clientId,
     creativeId: input.creativeId,
     copy: input.copy,
     cta: input.cta ?? null,
@@ -54,6 +58,7 @@ export async function createAd(input: AdInput) {
 
   // launch_ad is Tier B → proposeAction queues it for approval.
   const action = await proposeAction({
+    clientId,
     actionType: "launch_ad",
     entityType: "ad",
     entityId: ad.id,
