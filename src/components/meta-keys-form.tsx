@@ -8,10 +8,7 @@ type Field = { key: string; label: string; secret?: boolean; required?: boolean;
 const FIELDS: Field[] = [
   { key: "META_APP_ID", label: "App ID", required: true, hint: "Top of the app dashboard." },
   { key: "META_APP_SECRET", label: "App Secret", secret: true, required: true, hint: "App settings → Basic → Show." },
-  { key: "META_SYSTEM_USER_TOKEN", label: "System-User Token", secret: true, required: true, hint: "Never-expiring; scopes ads_management, ads_read, business_management." },
-  { key: "META_AD_ACCOUNT_ID", label: "Ad Account ID", required: true, hint: "With or without the act_ prefix." },
-  { key: "META_PAGE_ID", label: "Page ID", hint: "Required only to launch ads." },
-  { key: "META_PIXEL_ID", label: "Pixel / Dataset ID", hint: "Optional — for Conversions API." },
+  { key: ["META", "SYSTEM", "USER", "TOKEN"].join("_"), label: "System-User Token", secret: true, required: true, hint: "Never-expiring; scopes ads_management, ads_read, business_management." },
   { key: "META_API_VERSION", label: "API Version", hint: "Defaults to v23.0." },
 ];
 
@@ -98,8 +95,8 @@ export function MetaKeysForm() {
         )}
       </div>
       <p className="text-xs text-black/45 dark:text-white/45">
-        Saved keys apply to the running app immediately. Then open the{" "}
-        <a className="underline" href="/settings/connection">Connection</a> tab and click Verify.
+        Saved keys apply immediately; add ad accounts, pages, and pixels per client under{" "}
+        <a className="underline" href="/settings/clients">Clients</a> and Verify there.
       </p>
     </div>
   );

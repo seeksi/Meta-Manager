@@ -11,6 +11,7 @@ export const clients = pgTable("clients", {
   id: uuid("id").primaryKey().defaultRandom(),
   name: text("name").notNull(),
   status: text("status").notNull().default("active"),
+  verifyState: text("verify_state").notNull().default("draft"), // draft → verifying → active | failed
   metaAccountId: text("meta_account_id").notNull(),
   pageId: text("page_id"),
   pixelId: text("pixel_id"),

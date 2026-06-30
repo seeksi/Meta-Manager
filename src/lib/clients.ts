@@ -1,6 +1,6 @@
 // Client registry + per-call credential context. After M1 this is the ONLY place env Meta
 // credentials are read; per-client lib/route threading lands in G2/G3.
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { getDb } from "@/db";
 import { clients } from "@/db/schema";
 
@@ -11,6 +11,13 @@ export type Client = typeof clients.$inferSelect;
 // operational row to this client. SQL can't read env, so 0007 seeds placeholder creds and
 // ensureBootstrapClient() upserts the real META_* values from env at app boot.
 export const BOOTSTRAP_CLIENT_ID = "00000000-0000-0000-0000-000000000001";
+
+// ponytail: host secret manager in WS-3 (Vercel/secret store); env var for now.
+export const AGENCY_TOKEN_ENV = "META_SYSTEM_USER_TOKEN";
+/** The single agency System User token (Model A). Sole reader of the token env var. */
+export function agencyToken(): string {
+  return process.env[AGENCY_TOKEN_ENV]?.trim() ?? "";
+}
 
 // Pinned Marketing API version. Sourced here because clients.ts is the sole env boundary after
 // M1 (so meta/client.ts reads no process.env.META_*). meta/client.ts re-exports this.
@@ -80,14 +87,14 @@ export async function getClient(id: string): Promise<Client | undefined> {
 }
 
 export async function listActiveClients(): Promise<Client[]> {
-  return getDb().select().from(clients).where(eq(clients.status, "active"));
+  // Verify gate: schedulers/optimizers only see clients with a live Meta round-trip.
+  return getDb().select().from(clients).where(and(eq(clients.status, "active"), eq(clients.verifyState, "active")));
 }
 
 export async function clientContext(id: string): Promise<ClientContext> {
   const c = await getClient(id);
   if (!c) throw new Error(`unknown client: ${id}`);
-  // ponytail: token from env until WS-2 encrypted per-client store
-  const token = process.env.META_SYSTEM_USER_TOKEN ?? "";
+  const token = agencyToken();
   return {
     clientId: c.id,
     accountId: c.metaAccountId,
@@ -95,4 +102,24 @@ export async function clientContext(id: string): Promise<ClientContext> {
     pixelId: c.pixelId,
     token,
   };
+}
+
+export class ClientNotVerifiedError extends Error {
+  constructor(id: string) {
+    super(`client ${id} is not verified-active`);
+    this.name = "ClientNotVerifiedError";
+  }
+}
+
+export function isClientNotVerifiedError(e: unknown): e is ClientNotVerifiedError {
+  return e instanceof ClientNotVerifiedError;
+}
+
+/** Credential context for OPERATIONAL Meta calls. Fails closed unless the client is
+ *  status='active' AND verifyState='active' — the verify gate at the call boundary. */
+export async function activeClientContext(id: string): Promise<ClientContext> {
+  const c = await getClient(id);
+  if (!c) throw new Error(`unknown client: ${id}`);
+  if (c.status !== "active" || c.verifyState !== "active") throw new ClientNotVerifiedError(id);
+  return clientContext(id);
 }

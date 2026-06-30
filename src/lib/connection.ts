@@ -1,7 +1,7 @@
 // Module 1 — Meta connection status. docs/PRODUCT_SPEC.md §1. Single-brand: credentials
 // live in env. This reports which are present and a (provisional) verify state. Real live
 // verification is owned by meta-api-integrator once the Meta app is approved.
-import { META_API_VERSION, BOOTSTRAP_CLIENT_ID, clientContext } from "@/lib/clients";
+import { META_API_VERSION, BOOTSTRAP_CLIENT_ID, agencyToken, clientContext } from "@/lib/clients";
 
 const present = (k: string) => !!process.env[k]?.trim();
 
@@ -17,7 +17,7 @@ export function connectionStatus(): ConnectionStatus {
       { key: "appCreds", label: "Meta app created (App ID + Secret)", required: true,
         done: present("META_APP_ID") && present("META_APP_SECRET") },
       { key: "token", label: "System-user token (ads_management, ads_read, business_management)", required: true,
-        done: present("META_SYSTEM_USER_TOKEN") },
+        done: !!agencyToken() },
       { key: "adAccount", label: "Ad account selected", required: true, done: present("META_AD_ACCOUNT_ID") },
       { key: "pixel", label: "Pixel + CAPI configured", required: false, done: present("META_PIXEL_ID") },
       { key: "database", label: "Database connected", required: true, done: present("DATABASE_URL") },
@@ -28,8 +28,8 @@ export function connectionStatus(): ConnectionStatus {
 }
 
 export async function verifyConnection(clientId: string = BOOTSTRAP_CLIENT_ID) {
-  if (!present("META_SYSTEM_USER_TOKEN")) {
-    return { ok: false, message: "System-user token not set. Add META_SYSTEM_USER_TOKEN (see .env.example)." };
+  if (!agencyToken()) {
+    return { ok: false, message: "Meta agency token not set. Add it in Settings → Setup." };
   }
   // Live round-trip: read this client's ad account. Surfaces token/scope/asset errors directly.
   try {

@@ -53,8 +53,8 @@ beforeAll(async () => {
     await h.client.exec(readFileSync(join(dir, f), "utf8"));
   }
   await h.db.insert(clients).values([
-    { id: A, name: "Client A", metaAccountId: "act_A" },
-    { id: B, name: "Client B", metaAccountId: "act_B" },
+    { id: A, name: "Client A", metaAccountId: "act_A", verifyState: "active" },
+    { id: B, name: "Client B", metaAccountId: "act_B", verifyState: "active" },
   ]);
   await ensureControl(A);
   await ensureControl(B);

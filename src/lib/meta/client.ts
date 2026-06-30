@@ -57,7 +57,7 @@ async function graph<T>(
   // network call rather than ever hitting Meta with an empty bearer.
   token = "",
 ): Promise<T> {
-  if (!token) throw new Error("META_SYSTEM_USER_TOKEN not set — Meta app pending approval (see .env.example)");
+  if (!token) throw new Error("Meta agency token not set — app pending approval (see Settings → Setup)");
   // Token goes in the Authorization header, NOT the query string — keeps it out of URLs (and
   // therefore out of any logged/echoed request line or transport-error message).
   const search = new URLSearchParams();
@@ -190,6 +190,11 @@ export async function verifyAccess(ctx: MetaCtx): Promise<AccountInfo> {
     acctPath(ctx.accountId), { fields: "name,account_status,currency" }, "GET", true, ctx.token,
   );
   return { id: obj.id, name: obj.name, accountStatus: obj.account_status, currency: obj.currency };
+}
+
+/** Presence/read check for a Page or Pixel node by id. Throws MetaApiError if unreadable. */
+export async function verifyNode(ctx: MetaCtx, id: string): Promise<{ id: string; name?: string }> {
+  return graph<{ id: string; name?: string }>(id, { fields: "id,name" }, "GET", true, ctx.token);
 }
 
 // ── Writes (executor only) ─────────────────────────────────────────────────────
@@ -415,7 +420,7 @@ export interface ConversionEvent {
 /** Send a server-side conversion to the Pixel via CAPI. PII is sha256-hashed. */
 export async function sendConversion(ctx: MetaCtx, ev: ConversionEvent): Promise<{ ok: boolean; metaResponse: unknown }> {
   const pixelId = ctx.pixelId;
-  if (!pixelId) throw new Error("META_PIXEL_ID not set");
+  if (!pixelId) throw new Error("Pixel/Dataset ID not set for this client.");
   const user_data: Record<string, string[]> = {};
   if (ev.email) user_data.em = [sha256(ev.email)];
   if (ev.phone) user_data.ph = [sha256(ev.phone)];

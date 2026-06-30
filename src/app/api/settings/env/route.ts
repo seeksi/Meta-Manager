@@ -3,6 +3,7 @@
 // exposed beyond loopback, gate this route with an operator token.
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { AGENCY_TOKEN_ENV } from "@/lib/clients";
 import { writeEnvKeys, envPresence } from "@/lib/env-file";
 
 export const dynamic = "force-dynamic";
@@ -12,10 +13,7 @@ const KEYS = [
   "META_API_VERSION",
   "META_APP_ID",
   "META_APP_SECRET",
-  "META_SYSTEM_USER_TOKEN",
-  "META_AD_ACCOUNT_ID",
-  "META_PAGE_ID",
-  "META_PIXEL_ID",
+  AGENCY_TOKEN_ENV,
 ] as const;
 
 const Body = z

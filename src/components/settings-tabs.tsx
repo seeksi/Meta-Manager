@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 const TABS = [
   { href: "/settings/setup", label: "Setup & API Keys" },
   { href: "/settings/connection", label: "Connection" },
+  { href: "/settings/clients", label: "Clients" },
 ];
 
 export function SettingsTabs() {

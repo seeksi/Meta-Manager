@@ -6,7 +6,7 @@ import { desc, gte, eq, and } from "drizzle-orm";
 import { getDb } from "@/db";
 import { metaInsightsDaily, adActions } from "@/db/schema";
 import { proposeAction, ensureControl } from "./automation";
-import { getClient, clientContext } from "@/lib/clients";
+import { getClient, activeClientContext } from "@/lib/clients";
 import { getDailyBudgetCents } from "@/lib/meta/client";
 
 /** Recent optimizer-originated proposals for the recommendations UI, scoped to one client. */
@@ -132,7 +132,7 @@ export async function runOptimization(clientId: string, override: Partial<Optimi
   const client = await getClient(clientId);
   if (!client) throw new Error(`unknown client: ${clientId}`);
   const accountId = client.metaAccountId;
-  const ctx = await clientContext(clientId);
+  const ctx = await activeClientContext(clientId);
   // Targets come from THIS client's automation_control row; rest from defaults.
   const control = await ensureControl(clientId);
   const cfg: OptimizerConfig = {

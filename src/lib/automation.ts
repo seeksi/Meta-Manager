@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { getDb } from "@/db";
 import { automationControl, agencyControl, adActions, actionAttempts, auditEvents, metricFetches, ads, creatives } from "@/db/schema";
-import { clientContext, getClient, type ClientContext } from "@/lib/clients";
+import { activeClientContext, getClient, type ClientContext } from "@/lib/clients";
 import {
   evaluate, tierOf, ACTION_TYPES, type ActionType, type ProposedAction, type GuardrailContext,
 } from "./guardrails";
@@ -355,7 +355,7 @@ export async function executeAdAction(actionId: string) {
   const [action] = await getDb()
     .select({ clientId: adActions.clientId }).from(adActions).where(eq(adActions.id, actionId)).limit(1);
   if (!action) return { status: "failed" as const, error: "execute: action not found" };
-  const ctx = await clientContext(action.clientId);
+  const ctx = await activeClientContext(action.clientId);
   return serializeWrite(action.clientId, () => runExecute(actionId, ctx));
 }
 
@@ -439,7 +439,7 @@ export async function preflightAction(actionId: string, ctx?: ClientContext): Pr
   if (action.status !== "approved" && action.status !== "executing") return { allowed: false, reason: `status_${action.status}` };
   if (new Date(action.expiresAt) < new Date()) return { allowed: false, reason: "expired" };
   // Build the client's credential context if not supplied by the executor (e.g. direct callers/tests).
-  ctx = ctx ?? (await clientContext(action.clientId));
+  ctx = ctx ?? (await activeClientContext(action.clientId));
 
   const actionType = action.actionType as ActionType;
   const target = (action.targetState ?? {}) as Record<string, unknown>;

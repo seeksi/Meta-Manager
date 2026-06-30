@@ -2,7 +2,7 @@
 import { eq, desc, sql, and, gte } from "drizzle-orm";
 import { getDb } from "@/db";
 import { leads, metaInsightsDaily } from "@/db/schema";
-import { clientContext, getClient } from "@/lib/clients";
+import { activeClientContext, getClient, isClientNotVerifiedError } from "@/lib/clients";
 
 export const STAGES = ["new", "contacted", "qualified", "converted", "lost"] as const;
 export type Stage = (typeof STAGES)[number];
@@ -54,14 +54,17 @@ export async function captureLead(clientId: string, input: CaptureInput) {
   // Forward to Meta CAPI for attribution/optimization (event_id = lead id, dedups with the
   // browser pixel). Fire-and-forget: a CAPI hiccup must not fail lead capture.
   // NOTE: CAPI is an attribution event, NOT an ad-entity/budget write — it is intentionally
-  // outside the executor + kill-switch guardrails (those gate ad spend). Conversion signal keeps
-  // flowing even when ad writes are halted; it can never change spend. sendConversion fails closed
-  // when the client has no pixelId, so no env guard is needed here.
+  // outside the executor + kill-switch guardrails (those gate ad spend), but still requires a
+  // verified-active client credential context. sendConversion fails closed when the client has no
+  // pixelId, so no env guard is needed here.
   // ponytail: enqueue + retry the event instead of fire-and-forget when this moves off desktop.
-  void clientContext(row.clientId)
+  void activeClientContext(row.clientId)
     .then((ctx) => import("@/lib/meta/client")
       .then(({ sendConversion }) => sendConversion(ctx, { eventName: "Lead", eventId: row.id, email: attrs.email, phone: attrs.phone })))
-    .catch((e) => console.error("[capi] lead event failed:", e instanceof Error ? e.message : e));
+    .catch((e) => {
+      if (isClientNotVerifiedError(e)) return;
+      console.error("[capi] lead event failed:", e instanceof Error ? e.message : e);
+    });
   return { lead: row, deduped: false };
 }
 

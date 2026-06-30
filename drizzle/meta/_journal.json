@@ -57,6 +57,13 @@
       "when": 1782760959892,
       "tag": "0007_wet_leper_queen",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1782777524152,
+      "tag": "0008_unusual_doctor_doom",
+      "breakpoints": true
     }
   ]
 }

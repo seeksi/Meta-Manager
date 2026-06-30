@@ -51,17 +51,16 @@ const STEPS: { title: string; body: React.ReactNode }[] = [
   {
     title: "5. Ad Account ID (+ Page ID to launch)",
     body: (
-      <>From <em>Business Settings → Accounts → Ad accounts</em> — paste the number with or without{" "}
-        <code>act_</code>. To <strong>launch ads</strong>, also grab a <strong>Page ID</strong>{" "}
-        (Accounts → Pages) and assign that Page asset to the same System User.</>
+      <>Add each ad account and Page ID per client under <strong>Settings → Clients</strong>{" "}
+        (<strong>Add client</strong> → <strong>Verify access</strong>) after assigning those assets
+        to the System User.</>
     ),
   },
   {
     title: "6. Pixel / CAPI (optional)",
     body: (
-      <>For conversion tracking, copy your Pixel/Dataset ID from{" "}
-        <A href="https://business.facebook.com/events_manager">Events Manager</A> and assign the
-        Pixel asset to the System User. Skip if you only want metrics + budget/creative management.</>
+      <>For conversion tracking, assign the Pixel asset to the System User, then add the
+        Pixel/Dataset ID per client under <strong>Settings → Clients</strong> and Verify access.</>
     ),
   },
 ];
