@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meta Marketing API — Setup Guide</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel-2:#11161d; --border:#30363d;
+    --fg:#e6edf3; --muted:#9da7b3; --accent:#58a6ff; --accent-2:#7ee787;
+    --code-bg:#1b212b; --code-fg:#e6edf3; --warn-bg:#2d2410; --warn-bd:#9e7b1b;
+    --th:#1c232d;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:860px; margin:0 auto; padding:48px 24px 96px}
+  h1,h2,h3{line-height:1.25; font-weight:650; margin:1.8em 0 .6em}
+  h1{font-size:2rem; margin-top:0; padding-bottom:.4em; border-bottom:1px solid var(--border)}
+  h2{font-size:1.4rem; padding-bottom:.3em; border-bottom:1px solid var(--border)}
+  h3{font-size:1.12rem; color:var(--fg)}
+  p{margin:.7em 0}
+  a{color:var(--accent); text-decoration:none}
+  a:hover{text-decoration:underline}
+  strong{color:#fff; font-weight:650}
+  hr{border:0; border-top:1px solid var(--border); margin:2.4em 0}
+  ul,ol{padding-left:1.4em}
+  li{margin:.3em 0}
+  code{
+    background:var(--code-bg); color:var(--code-fg); font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:.88em; padding:.15em .4em; border-radius:6px; border:1px solid var(--border);
+  }
+  pre{
+    background:var(--code-bg); border:1px solid var(--border); border-radius:10px;
+    padding:14px 16px; overflow:auto; margin:1em 0;
+  }
+  pre code{background:none; border:0; padding:0; font-size:.86em; line-height:1.55}
+  blockquote{
+    margin:1.2em 0; padding:.6em 1em; border-left:3px solid var(--accent);
+    background:var(--panel); border-radius:0 8px 8px 0; color:var(--muted);
+  }
+  blockquote.warn{border-left-color:var(--warn-bd); background:var(--warn-bg); color:#f0e2b6}
+  blockquote p{margin:.3em 0}
+  table{border-collapse:collapse; width:100%; margin:1.2em 0; font-size:.94em; overflow:hidden; border-radius:8px}
+  th,td{border:1px solid var(--border); padding:9px 12px; text-align:left; vertical-align:top}
+  th{background:var(--th); color:#fff; font-weight:600}
+  tr:nth-child(even) td{background:var(--panel-2)}
+  .lead{color:var(--muted)}
+  .toc{background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px 20px; margin:1.6em 0}
+  .toc h2{border:0; margin:.2em 0 .4em; font-size:1rem; color:var(--muted); text-transform:uppercase; letter-spacing:.05em}
+  .toc ol{margin:.3em 0}
+  h2 .anchor{color:var(--muted); font-weight:400; font-size:.8em; margin-left:.4em; opacity:0}
+  h2:hover .anchor{opacity:1}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Meta Marketing API — Setup Guide</h1>
+
+<p class="lead">How to create a Meta app and obtain every credential this tool needs. This is
+<strong>single-brand</strong>: you manage <strong>your own</strong> ad account, so you do
+<strong>not</strong> need a lengthy App Review — a System User with direct asset access gives you
+everything (see <a href="#s7">§7</a>).</p>
+
+<p>Each step maps 1:1 to the checklist on the app's <strong>Settings → Connection</strong> page
+(<code>/settings/connection</code>). Fill the matching <code>.env</code> variable and the item turns green.</p>
+
+<table>
+  <thead><tr><th><code>.env</code> variable</th><th>This guide</th></tr></thead>
+  <tbody>
+    <tr><td><code>META_APP_ID</code>, <code>META_APP_SECRET</code></td><td><a href="#s2">§2</a></td></tr>
+    <tr><td><code>META_SYSTEM_USER_TOKEN</code></td><td><a href="#s4">§4</a></td></tr>
+    <tr><td><code>META_AD_ACCOUNT_ID</code></td><td><a href="#s5">§5</a></td></tr>
+    <tr><td><code>META_PAGE_ID</code> <em>(required to launch ads)</em></td><td><a href="#s5">§5</a></td></tr>
+    <tr><td><code>META_PIXEL_ID</code> <em>(optional)</em></td><td><a href="#s6">§6</a></td></tr>
+    <tr><td><code>META_API_VERSION</code></td><td>defaults to <code>v23.0</code>; bump only when you migrate</td></tr>
+  </tbody>
+</table>
+
+<blockquote><p>⏱️ ~20–30 minutes. Have admin access to the Meta Business Portfolio that owns your ad account.</p></blockquote>
+
+<hr>
+
+<h2 id="s1">1. Prerequisites</h2>
+<p>Before touching the developer site, make sure you have:</p>
+<ol>
+  <li>A <strong>Facebook account</strong> that is an <strong>admin</strong> of…</li>
+  <li>…a <strong>Meta Business Portfolio</strong> (formerly Business Manager) — create/check at
+    <a href="https://business.facebook.com/settings">business.facebook.com/settings</a>.</li>
+  <li>An <strong>ad account</strong> inside that portfolio <strong>with an active payment method</strong>
+    (Business Settings → Accounts → Ad accounts). You can't spend without one.</li>
+  <li><em>(For conversion tracking only)</em> a <strong>Pixel / dataset</strong> in Events Manager.</li>
+</ol>
+<p>If you run ads today from Ads Manager, you already have 1–3.</p>
+
+<hr>
+
+<h2 id="s2">2. Create a Meta app</h2>
+<ol>
+  <li>Go to <a href="https://developers.facebook.com/apps">developers.facebook.com/apps</a> → <strong>Create app</strong>.
+    (First time: register as a developer and verify your account.)</li>
+  <li><strong>Use case:</strong> choose <strong>Other</strong> → <strong>Next</strong>.</li>
+  <li><strong>App type:</strong> choose <strong>Business</strong> → <strong>Next</strong>. (Business type unlocks the
+    Marketing API and ties the app to your Business Portfolio.)</li>
+  <li>Enter an <strong>app name</strong> + contact email, and <strong>select your Business Portfolio</strong>. Create.</li>
+  <li>In the app dashboard, <strong>Add product → Marketing API → Set up</strong>.</li>
+</ol>
+<p><strong>Collect your credentials</strong> (→ <code>.env</code>):</p>
+<ul>
+  <li><strong>App ID</strong> — shown at the top of the app dashboard. → <code>META_APP_ID</code></li>
+  <li><strong>App Secret</strong> — <strong>App settings → Basic → App Secret → Show</strong>. → <code>META_APP_SECRET</code></li>
+</ul>
+<blockquote class="warn"><p>Keep the App Secret secret. Never ship it to the browser or commit it. This tool only reads it
+server-side from <code>.env</code>.</p></blockquote>
+
+<hr>
+
+<h2 id="s3">3. Why a System User (not your personal token)</h2>
+<p>The token picker in the app dashboard ("Graph API Explorer") issues <strong>short-lived user tokens</strong>
+that expire in ~1–2 hours — useless for an always-on tool. Instead create a <strong>System User</strong> token:
+server-to-server, tied to the business (not a person), and can be set to <strong>never expire</strong>. This is
+the supported path for automated ad management.</p>
+
+<hr>
+
+<h2 id="s4">4. Create a System User + token (the important one)</h2>
+<p>All of this happens in <strong>Business Settings</strong>, not the app dashboard:
+<a href="https://business.facebook.com/settings">business.facebook.com/settings</a>.</p>
+<ol>
+  <li><strong>Business Settings → Users → System Users → Add.</strong>
+    <ul><li>Name it (e.g. <code>ads-manager-bot</code>).</li>
+    <li>Role: <strong>Admin</strong> (needed to manage campaigns/budgets). Create.</li></ul></li>
+  <li><strong>Assign the app:</strong> with the system user selected → <strong>Add Assets → Apps →</strong> select your app →
+    enable <strong>Manage app</strong> (full control) → Save.</li>
+  <li><strong>Assign the ad account:</strong> <strong>Add Assets → Ad accounts →</strong> select your ad account → enable
+    <strong>Manage campaigns</strong> (full control) → Save.
+    <em>(Optional, for §6: also add the <strong>Pixel/Dataset</strong> asset.)</em></li>
+  <li><strong>Generate the token:</strong> system user → <strong>Generate new token</strong> → select <strong>your app</strong> →
+    <ul>
+      <li><strong>Token expiration: Never.</strong></li>
+      <li><strong>Permissions (scopes):</strong> check
+        <ul>
+          <li><code>ads_management</code> — create/update campaigns, budgets, status (writes)</li>
+          <li><code>ads_read</code> — insights/metrics (reads)</li>
+          <li><code>business_management</code> — read business + asset metadata</li>
+          <li><em>(optional)</em> <code>read_insights</code></li>
+        </ul></li>
+      <li><strong>Generate token</strong> → <strong>copy it now</strong> (shown only once). → <code>META_SYSTEM_USER_TOKEN</code></li>
+    </ul></li>
+</ol>
+<p><strong>Verify the token</strong> before pasting it anywhere:</p>
+<ul>
+  <li>Access Token Debugger: <a href="https://developers.facebook.com/tools/debug/accesstoken">developers.facebook.com/tools/debug/accesstoken</a>
+    — paste the token; confirm <strong>Scopes</strong> include the three above and <strong>Expires = Never</strong>.</li>
+  <li>Or a quick call (replace the token):
+<pre><code>curl "https://graph.facebook.com/v23.0/me/adaccounts?access_token=YOUR_TOKEN"</code></pre>
+    A JSON list of ad accounts = success. An <code>error</code> block = re-check scopes/asset access.</li>
+</ul>
+
+<hr>
+
+<h2 id="s5">5. Get your Ad Account ID</h2>
+<p><strong>Business Settings → Accounts → Ad accounts</strong> — the <strong>Account ID</strong> is the number shown
+(also visible in any Ads Manager URL as <code>act=XXXXXXXXXX</code>).</p>
+<p>→ <code>META_AD_ACCOUNT_ID</code>. You may paste it <strong>with or without</strong> the <code>act_</code> prefix — the client
+normalizes it (<code>123456789</code> and <code>act_123456789</code> both work).</p>
+
+<h3>Page ID (required to launch ads)</h3>
+<p>Launched ads post as a <strong>Facebook Page</strong>, so creating ads needs a Page ID. Find it in
+<strong>Business Settings → Accounts → Pages</strong> (or the Page's <strong>About</strong> section). Also <strong>assign the Page
+asset to your System User</strong> (§4 step 3, same as the ad account) so the token can use it.
+→ <code>META_PAGE_ID</code>. <em>(Not needed for metrics/budget management — only for the ad-launch flow.)</em></p>
+
+<hr>
+
+<h2 id="s6">6. Pixel + CAPI (optional: conversion tracking)</h2>
+<p>Needed for lead/purchase attribution and conversion optimization; skip if you only want
+metrics + budget/creative management.</p>
+<ol>
+  <li><strong>Events Manager</strong> → <a href="https://business.facebook.com/events_manager">business.facebook.com/events_manager</a> → your <strong>Pixel/Dataset</strong>.</li>
+  <li>Copy the <strong>Pixel/Dataset ID</strong>. → <code>META_PIXEL_ID</code></li>
+  <li>Conversions API (CAPI) server events reuse <code>META_SYSTEM_USER_TOKEN</code> (ensure the Pixel asset is
+    assigned to the system user, §4 step 3). Hash PII and send an <code>event_id</code> matching the browser
+    pixel event for dedup.</li>
+</ol>
+
+<hr>
+
+<h2 id="s7">7. Permissions &amp; access levels</h2>
+<p><strong>For your own ad account you do <em>not</em> need full App Review.</strong> New apps run in <strong>Development mode</strong>
+with <strong>Standard Access</strong> to the Marketing API, which is enough to manage ad accounts the system
+user has been granted (§4). That covers this single-brand tool.</p>
+<p>You only need <strong>Advanced Access / App Review</strong> if you:</p>
+<ul>
+  <li>manage ad accounts you <strong>don't own</strong> (agency / multi-tenant), or</li>
+  <li>hit <strong>Standard Access rate limits</strong> and need the higher tier.</li>
+</ul>
+<p>To request it later: app dashboard → <strong>App Review → Permissions and Features</strong> → request Advanced
+Access for <code>ads_management</code> and <code>ads_read</code>.</p>
+<blockquote class="warn"><p>🔒 Keep the app in Development mode until you've tested with the <strong>kill switch engaged</strong> and a
+<strong>native account spend cap</strong> set (see README → Autonomy &amp; safety).
+This app ships with <code>WRITE_MODE=off</code> by default — nothing writes to Meta until you flip it on.</p></blockquote>
+
+<hr>
+
+<h2 id="s8">8. Put it together &amp; verify</h2>
+<ol>
+  <li>Add the values to <code>.env</code> (see <code>.env.example</code>):
+<pre><code>META_API_VERSION=v23.0
+META_APP_ID=...
+META_APP_SECRET=...
+META_SYSTEM_USER_TOKEN=...        # never-expiring system user token
+META_AD_ACCOUNT_ID=...            # with or without act_
+META_PIXEL_ID=...                 # optional</code></pre></li>
+  <li>Restart the app (<code>npm run desktop</code> / <code>npm run dev</code>).</li>
+  <li>Open <strong>Settings → Connection</strong> (<code>/settings/connection</code>). Each required item should be green;
+    click <strong>Verify</strong>.</li>
+</ol>
+
+<hr>
+
+<h2 id="troubleshooting">Troubleshooting</h2>
+<table>
+  <thead><tr><th>Symptom</th><th>Likely cause / fix</th></tr></thead>
+  <tbody>
+    <tr><td><code>(#200) Permissions error</code> / <code>requires ads_management</code></td>
+        <td>Scope missing on the token, or the ad account/app isn't assigned to the system user (§4 steps 2–3). Regenerate the token after fixing assets.</td></tr>
+    <tr><td><code>Invalid OAuth access token</code> / works then stops</td>
+        <td>Token expired — you generated a user token, not a <strong>never-expiring System User</strong> token (§3–4).</td></tr>
+    <tr><td><code>Unsupported get request</code> / <code>does not exist</code> on the ad account</td>
+        <td>Wrong <code>META_AD_ACCOUNT_ID</code>, or the system user lacks access to it. Confirm in Business Settings → Ad accounts.</td></tr>
+    <tr><td><code>(#17) User request limit reached</code></td>
+        <td>Standard Access rate limit. Back off (the client already retries with backoff); request Advanced Access for higher limits (§7).</td></tr>
+    <tr><td>Token debugger shows <code>Expires: in ~1 hour</code></td>
+        <td>Not a system user token. Redo §4 with <strong>Expiration: Never</strong>.</td></tr>
+  </tbody>
+</table>
+
+<p><strong>Reference docs</strong></p>
+<ul>
+  <li>Marketing API: <a href="https://developers.facebook.com/docs/marketing-api">developers.facebook.com/docs/marketing-api</a></li>
+  <li>System Users: <a href="https://developers.facebook.com/docs/marketing-api/system-users">developers.facebook.com/docs/marketing-api/system-users</a></li>
+  <li>Access Token Debugger: <a href="https://developers.facebook.com/tools/debug/accesstoken">developers.facebook.com/tools/debug/accesstoken</a></li>
+  <li>API changelog / versions: <a href="https://developers.facebook.com/docs/graph-api/changelog">developers.facebook.com/docs/graph-api/changelog</a></li>
+</ul>
+
+</div>
+</body>
+</html>
