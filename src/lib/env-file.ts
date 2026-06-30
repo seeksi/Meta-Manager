@@ -18,6 +18,12 @@ function envPath() {
 
 export type EnvUpdates = Record<string, string | undefined>;
 
+export function envWritesAllowed(): boolean {
+  // NODE_ENV is not the gate: Electron desktop:prod is production but must keep local .env writes.
+  // Hosted containers set HOSTED=1 because host-injected env/secrets are the source of truth there.
+  return process.env.HOSTED !== "1";
+}
+
 // Merge updates into .env, preserving existing lines, comments, and order. Only non-empty
 // trimmed values are written — a blank field leaves the existing value untouched.
 export function writeEnvKeys(updates: EnvUpdates): string[] {

@@ -16,6 +16,7 @@
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
     "build:standalone": "next build && mkdir -p .next/standalone/public .next/standalone/.next/static && cp -r public/. .next/standalone/public/ && cp -r .next/static/. .next/standalone/.next/static/",
+    "start:standalone": "node .next/standalone/server.js",
     "desktop": "ELECTRON_DEV=1 electron .",
     "desktop:prod": "npm run build:standalone && electron .",
     "dist": "npm run build:standalone && electron-builder --linux AppImage"

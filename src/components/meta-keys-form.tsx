@@ -1,6 +1,6 @@
 "use client";
-// Paste Meta API credentials and save them straight into .env. Presence is fetched on
-// mount (never the secret values); a blank field leaves the saved value untouched.
+// Paste Meta API credentials and save them straight into local .env when editable. Presence
+// is fetched on mount (never the secret values); hosted deploys manage secrets outside the app.
 import { useEffect, useState } from "react";
 
 type Field = { key: string; label: string; secret?: boolean; required?: boolean; hint: string };
@@ -15,6 +15,7 @@ const FIELDS: Field[] = [
 export function MetaKeysForm() {
   const [present, setPresent] = useState<Record<string, boolean>>({});
   const [values, setValues] = useState<Record<string, string>>({});
+  const [editable, setEditable] = useState(true);
   const [reveal, setReveal] = useState(false);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
@@ -22,6 +23,7 @@ export function MetaKeysForm() {
   async function loadPresence() {
     const r = await fetch("/api/settings/env").then((x) => x.json()).catch(() => null);
     if (r?.present) setPresent(r.present);
+    if (typeof r?.editable === "boolean") setEditable(r.editable);
   }
   // eslint-disable-next-line react-hooks/set-state-in-effect -- setState runs after the async fetch, not synchronously
   useEffect(() => { loadPresence(); }, []);
@@ -55,6 +57,11 @@ export function MetaKeysForm() {
 
   return (
     <div className="space-y-3">
+      {!editable && (
+        <p className="rounded-md border border-amber-300/60 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-400/30 dark:bg-amber-950/30 dark:text-amber-200">
+          Secrets are managed by the host on this deployment.
+        </p>
+      )}
       <label className="flex items-center gap-2 text-xs text-black/60 dark:text-white/60">
         <input type="checkbox" checked={reveal} onChange={(e) => setReveal(e.target.checked)} />
         Reveal what I type
@@ -71,10 +78,11 @@ export function MetaKeysForm() {
             type={f.secret && !reveal ? "password" : "text"}
             autoComplete="off"
             spellCheck={false}
+            disabled={!editable}
             value={values[f.key] ?? ""}
             onChange={(e) => setValues((v) => ({ ...v, [f.key]: e.target.value }))}
             placeholder={present[f.key] ? "•••••••• (leave blank to keep)" : `paste ${f.label}`}
-            className="w-full rounded-md border border-black/15 dark:border-white/15 bg-transparent px-3 py-1.5 text-sm font-mono"
+            className="w-full rounded-md border border-black/15 dark:border-white/15 bg-transparent px-3 py-1.5 text-sm font-mono disabled:opacity-50"
           />
           <p className="text-xs text-black/45 dark:text-white/45">{f.hint}</p>
         </div>
@@ -83,7 +91,7 @@ export function MetaKeysForm() {
       <div className="flex items-center gap-3 pt-1">
         <button
           onClick={save}
-          disabled={busy}
+          disabled={busy || !editable}
           className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
         >
           {busy ? "Saving…" : "Save to .env"}

@@ -1,0 +1,18 @@
+# Always-on hosted engine (the desktop-free production runtime). Runs the Next standalone
+# server with the in-process scheduler active. DB is external (Neon, or the local dev Postgres
+# from docker-compose.yml reached via host.docker.internal) — set DATABASE_URL in .env.
+#   docker compose -f docker-compose.app.yml up --build
+services:
+  app:
+    build: .
+    command: node server.js
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      HOSTED: "1"
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0

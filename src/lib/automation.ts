@@ -3,6 +3,7 @@
 // executor (Inngest). Every state change is audited. This module never writes to Meta.
 import { eq, and, desc, sql, inArray } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
+import type { Pool } from "pg";
 import { z } from "zod";
 import { getDb } from "@/db";
 import { automationControl, agencyControl, adActions, actionAttempts, auditEvents, metricFetches, ads, creatives } from "@/db/schema";
@@ -334,15 +335,17 @@ export async function listAudit(clientId?: string, limit = 50) {
 
 // ── Executor — the ONLY path that writes to Meta ───────────────────────────────────
 
-/** preflight re-check → apply absolute patch → reconcile. Runs inline (single-instance
- *  desktop build, no durable queue). Records every outcome; never rethrows to the caller —
+/** preflight re-check → apply absolute patch → reconcile. Runs inline. Records every outcome; never rethrows to the caller —
  *  the Meta client retries transient errors internally, and the next poll reconciles
- *  anything left uncertain. ponytail: inline executor; add a durable queue if multi-instance. */
+ *  anything left uncertain. ponytail: durable queue if scheduling moves past single-primary app
+ *  execution; the Postgres advisory lock below is the G3 cross-instance write mutex. */
 // Serialize executor writes PER CLIENT so only one Meta write per client runs at a time, while
-// different clients run concurrently. This closes the TOCTOU where two concurrent dispatches for
-// the same client both pass the unresolved-writes gate before either flips to `executing`
-// (double-click, scheduler + UI, retries). ponytail: in-process per-client mutex; durable queue +
-// Postgres advisory locks (held across preflight + the Meta write) for multi-instance = WS-3.
+// different clients run concurrently. A pg_advisory_xact_lock held in one transaction would pin a
+// connection idle-in-transaction across the Meta HTTP write and force threading `tx` through
+// preflight/reconcile/runLaunch. A session-level pg_advisory_lock on a dedicated pooled connection
+// gives the same cross-instance exclusion, acquired before preflight and released after reconcile,
+// without a long-open transaction. The ad_actions.idempotencyKey unique constraint remains the
+// second line of defense. The Map mutex is only the pglite/no-Pool fallback for single-process tests.
 const writeChains = new Map<string, Promise<unknown>>();
 function serializeWrite<T>(clientId: string, fn: () => Promise<T>): Promise<T> {
   const prev = writeChains.get(clientId) ?? Promise.resolve();
@@ -351,17 +354,44 @@ function serializeWrite<T>(clientId: string, fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
+async function withClientWriteLock<T>(clientId: string, fn: () => Promise<T>): Promise<T> {
+  const key = `adwrite:${clientId}`;
+  const client = (getDb() as unknown as { $client?: unknown }).$client;
+  if (client && typeof (client as { connect?: unknown }).connect === "function") {
+    const pool = client as Pool;
+    const conn = await pool.connect();
+    let locked = false;
+    try {
+      await conn.query("SELECT pg_advisory_lock(hashtext($1))", [key]);
+      locked = true;
+      return await fn();
+    } finally {
+      if (locked) {
+        try {
+          await conn.query("SELECT pg_advisory_unlock(hashtext($1))", [key]);
+        } finally {
+          conn.release();
+        }
+      } else {
+        conn.release();
+      }
+    }
+  }
+  return serializeWrite(clientId, fn);
+}
+
 export async function executeAdAction(actionId: string) {
   const [action] = await getDb()
     .select({ clientId: adActions.clientId }).from(adActions).where(eq(adActions.id, actionId)).limit(1);
   if (!action) return { status: "failed" as const, error: "execute: action not found" };
   const ctx = await activeClientContext(action.clientId);
-  return serializeWrite(action.clientId, () => runExecute(actionId, ctx));
+  return withClientWriteLock(action.clientId, () => runExecute(actionId, ctx));
 }
 
 async function runExecute(actionId: string, ctx: ClientContext) {
   const pre = await preflightAction(actionId, ctx);
   if (!pre.allowed || (!pre.metaPayload && !pre.launch)) {
+    if (pre.reason === "status_succeeded") return { status: "succeeded" as const };
     return reconcileAction(actionId, { ok: false, error: `preflight: ${pre.reason}` });
   }
   let applied: ApplyResult;

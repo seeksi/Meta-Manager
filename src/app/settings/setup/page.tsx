@@ -91,8 +91,8 @@ export default function SetupPage() {
       <Card className="mb-4">
         <h2 className="mb-1 font-medium">API keys</h2>
         <p className="mb-3 text-sm text-black/60 dark:text-white/60">
-          Paste the values from the steps above. They save into your local <code>.env</code> and take
-          effect immediately — no restart needed.
+          In local dev and Electron, paste the values from the steps above to save them into your
+          local <code>.env</code>. Hosted deployments use host-managed secrets.
         </p>
         <MetaKeysForm />
       </Card>

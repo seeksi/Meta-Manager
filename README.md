@@ -2,15 +2,16 @@
 
 Single-brand, single-operator Meta Ads management console. Monitor metrics, adjust budgets,
 upload creatives, assemble & launch ads, generate copy, research competitors, run tiered
-optimization — all from one **desktop app**, with a guardrailed autonomy engine over real ad spend.
+optimization — now hosted as an always-on Next.js server, with Electron kept as an optional
+local shell.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/PRODUCT_SPEC.md`](docs/PRODUCT_SPEC.md).
 
 ## Stack
 
-Electron desktop shell wrapping Next.js (App Router) + TypeScript · Neon Postgres + Drizzle ·
-in-process scheduler (durable jobs run while the app is open) · Vercel Blob (creatives) ·
-Vercel AI Gateway (copywriting) · Tailwind.
+Next.js standalone server (App Router) + TypeScript · Neon Postgres + Drizzle · in-process
+scheduler · Vercel Blob (creatives) · Vercel AI Gateway (copywriting) · Tailwind · optional
+Electron desktop shell for local dev.
 
 ## Setup
 
@@ -23,6 +24,17 @@ npm run desktop:prod        # build the standalone server + run it in Electron
 # or browser-only:
 npm run dev                 # http://localhost:3000
 ```
+
+### Production runtime
+
+```bash
+npm run build:standalone
+npm run start:standalone    # runs .next/standalone/server.js
+```
+
+The hosted Node server (`node server.js` inside Docker) is the production runtime that carries
+automation. Electron is optional local dev only. See [`docs/DEPLOY.md`](docs/DEPLOY.md) for Docker
+build/run commands and required host secrets.
 
 ### Package an installer
 
@@ -42,9 +54,8 @@ real brand icon). To add a `.deb`, append `"deb"` to `build.linux.target`. Outpu
 > enabled before `npm run desktop` / `npm run dist`.
 
 The background scheduler (insights poll every 15 min, optimizer daily at 09:00 local) runs
-in-process whenever the server is up — so automation is active while the desktop app is open.
-Set `DISABLE_SCHEDULER=1` to turn it off. The native Meta account spend cap remains the 24/7
-backstop for the hours the app is closed.
+in-process whenever the Node server is up. Set `DISABLE_SCHEDULER=1` to turn it off, especially
+for a second web-only instance. The native Meta account spend cap remains the platform backstop.
 
 ### Environment (`.env`)
 
@@ -68,7 +79,9 @@ Neon standard connection string.
 **Local (no Neon account needed):**
 
 ```bash
-docker compose up -d                                   # local Postgres on :5432
+docker run --rm -d --name meta-postgres -p 5432:5432 \
+  -e POSTGRES_USER=meta -e POSTGRES_PASSWORD=meta -e POSTGRES_DB=meta_ads \
+  postgres:17
 export DATABASE_URL=postgres://meta:meta@localhost:5432/meta_ads
 npm run db:migrate                                     # apply drizzle/ migrations
 ```
@@ -100,8 +113,7 @@ This app writes to a live ad budget. Safeguards, in order:
    (never assumed applied); while any write is `executing`/`uncertain`, new spend-increasing
    proposals are blocked (`UNRESOLVED_WRITES`) until reconciled — pauses/decreases stay allowed.
 6. **External backstop** — also set a **native Meta account spend cap**. The app's guardrails are
-   necessary but the platform-level cap is the real last line of defense, especially for the
-   hours the desktop app (and its scheduler) is closed.
+   necessary but the platform-level cap is the real last line of defense.
 
 Configure caps and write mode at **/automation**. For a step-by-step safe go-live sequence
 (database → credentials → caps → first read → first guarded write → launch), follow

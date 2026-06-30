@@ -5,10 +5,17 @@ import {
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
-// ── Clients (the M1 scoping root; credential-context helpers live in lib/clients.ts) ──
+// ── Operators + Clients (the M1/G4 scoping roots; helpers live in lib/clients.ts) ──
+export const operators = pgTable("operators", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  username: text("username").notNull().unique(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 // One row per managed Meta ad account. status: active|paused|archived.
 export const clients = pgTable("clients", {
   id: uuid("id").primaryKey().defaultRandom(),
+  ownerId: uuid("owner_id").references(() => operators.id),
   name: text("name").notNull(),
   status: text("status").notNull().default("active"),
   verifyState: text("verify_state").notNull().default("draft"), // draft → verifying → active | failed
@@ -172,6 +179,21 @@ export const auditEvents = pgTable(
   (t) => [index("ix_audit_created").on(t.createdAt), index("ix_audit_client").on(t.clientId)],
 );
 
+export const schedulerRuns = pgTable(
+  "scheduler_runs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    job: text("job").notNull(), // optimize | poll | future jobs
+    // null = current agency-wide sweep. ponytail: per-client rows when jobs become per-client.
+    clientId: uuid("client_id").references(() => clients.id),
+    startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+    ok: boolean("ok"),
+    result: jsonb("result"),
+  },
+  (t) => [index("ix_scheduler_runs_job_started").on(t.job, t.startedAt.desc())],
+);
+
 export const spendReservations = pgTable("spend_reservations", {
   actionId: uuid("action_id").primaryKey().references(() => adActions.id),
   clientId: uuid("client_id").notNull().references(() => clients.id),
@@ -249,9 +271,9 @@ export const experiments = pgTable("experiments", {
 });
 
 export const schema = {
-  clients, agencyControl,
+  operators, clients, agencyControl,
   metricFetches, metaInsightsDaily, metaInsightsHourly, metricRollupsDaily,
-  automationControl, adActions, actionAttempts, auditEvents, spendReservations,
+  automationControl, adActions, actionAttempts, auditEvents, schedulerRuns, spendReservations,
   creatives, ads, leads, competitorCreatives, experiments,
 };
 

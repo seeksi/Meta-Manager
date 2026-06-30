@@ -7,6 +7,9 @@ import { join } from "node:path";
 
 const h = vi.hoisted(() => {
   process.env.WRITE_MODE = "all";
+  process.env.OPERATOR_USERNAME = "operator";
+  process.env.OPERATOR_PASSWORD = "password";
+  process.env.SESSION_SECRET = "test-session-secret-long";
   return { db: null as unknown as ReturnType<typeof drizzle>, client: null as unknown as PGlite };
 });
 
@@ -39,7 +42,8 @@ vi.mock("@/lib/meta/client", () => {
 
 import { auditEvents, clients } from "@/db/schema";
 import { getControl } from "@/lib/automation";
-import { activeClientContext, ClientNotVerifiedError, getClient, listActiveClients } from "@/lib/clients";
+import { signSession, SESSION_COOKIE_NAME } from "@/lib/auth";
+import { activeClientContext, BOOTSTRAP_OPERATOR_ID, ClientNotVerifiedError, getClient, listActiveClients } from "@/lib/clients";
 import { MetaApiError, verifyAccess, verifyNode } from "@/lib/meta/client";
 import { createClient, verifyClient } from "@/lib/onboarding";
 
@@ -57,6 +61,13 @@ beforeEach(() => {
   vi.mocked(verifyNode).mockReset();
   vi.mocked(verifyNode).mockResolvedValue({ id: "node_1" });
 });
+
+async function authedRequest(url: string, init: RequestInit = {}) {
+  const token = await signSession(BOOTSTRAP_OPERATOR_ID);
+  const headers = new Headers(init.headers);
+  headers.set("cookie", `${SESSION_COOKIE_NAME}=${token}`);
+  return new Request(url, { ...init, headers });
+}
 
 describe("G2 client onboarding verify gate", () => {
   it("success activates", async () => {
@@ -143,7 +154,7 @@ describe("G2 client onboarding verify gate", () => {
       expect(result.ok).toBe(true);
 
       const { GET } = await import("@/app/api/clients/route");
-      const res = await GET();
+      const res = await GET(await authedRequest("http://localhost/api/clients"));
       const text = await res.text();
       expect(text).not.toContain(sentinel);
 
@@ -172,14 +183,14 @@ describe("G2 client onboarding verify gate", () => {
       pixelId: "12345",
     };
 
-    const badAccount = await POST(new Request("http://localhost/api/clients", {
+    const badAccount = await POST(await authedRequest("http://localhost/api/clients", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ ...base, metaAccountId: "123/insights?x=1" }),
     }));
     expect(badAccount.status).toBe(400);
 
-    const badPixel = await POST(new Request("http://localhost/api/clients", {
+    const badPixel = await POST(await authedRequest("http://localhost/api/clients", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ ...base, pixelId: "../foo" }),
