@@ -3,7 +3,7 @@
 import { PageHeader, KpiCard, Card } from "@/components/ui";
 import { TrendChart } from "@/components/trend-chart";
 import { getDashboardSummary, getTimeseries } from "@/lib/metrics";
-import { BOOTSTRAP_CLIENT_ID } from "@/lib/clients";
+import { activeClientId } from "@/lib/active-client";
 
 export const dynamic = "force-dynamic";
 
@@ -15,9 +15,9 @@ export default async function DashboardPage() {
   let trend: Awaited<ReturnType<typeof getTimeseries>> = [];
   let dbError: string | null = null;
   try {
-    // ponytail: default to the bootstrap client until a client switcher (post-M2 onboarding) lands.
+    const clientId = await activeClientId();
     [summary, trend] = await Promise.all([
-      getDashboardSummary(BOOTSTRAP_CLIENT_ID), getTimeseries(BOOTSTRAP_CLIENT_ID),
+      getDashboardSummary(clientId), getTimeseries(clientId),
     ]);
   } catch (e) {
     dbError = e instanceof Error ? e.message : String(e);

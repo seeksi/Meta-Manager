@@ -3,6 +3,7 @@
 // global kill-switch. ponytail: hand-rolled Tailwind. Upgrade path: shadcn/ui primitives.
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { ClientSwitcher } from "@/components/client-switcher";
 
 const NAV = [
   { href: "/", label: "Dashboard" },
@@ -45,7 +46,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       </aside>
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex items-center justify-between border-b border-black/10 dark:border-white/10 px-6 py-3">
-          <span className="text-sm text-black/60 dark:text-white/60">Single-brand console</span>
+          <ClientSwitcher />
           <KillSwitch />
         </header>
         <main className="flex-1 p-6">{children}</main>
