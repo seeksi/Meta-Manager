@@ -126,6 +126,8 @@ export const automationControl = pgTable("automation_control", {
   targetCpaCents: integer("target_cpa_cents").notNull().default(5000),
   targetRoas: numeric("target_roas").notNull().default("2"),
   activePolicyVersion: integer("active_policy_version").notNull().default(1),
+  activeComplianceVersion: integer("active_compliance_version").notNull().default(1), // M5 ruleset version
+
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   updatedBy: text("updated_by").notNull().default("system"),
 });
@@ -146,6 +148,9 @@ export const adActions = pgTable("ad_actions", {
   projectedDailySpendCents: integer("projected_daily_spend_cents").notNull().default(0),
   evidence: jsonb("evidence"),
   guardrailResult: jsonb("guardrail_result"),
+  // M5 compliance gate — status filters the queue; findings carry the rule + ruleset version.
+  complianceStatus: text("compliance_status").notNull().default("pass"), // pass | flag | block
+  complianceFindings: jsonb("compliance_findings"),
   policyVersion: integer("policy_version").notNull(),
   idempotencyKey: text("idempotency_key").notNull().unique(),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
