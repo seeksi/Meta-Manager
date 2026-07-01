@@ -59,7 +59,7 @@ export async function ensureBootstrapClient(): Promise<void> {
     .where(eq(clients.id, BOOTSTRAP_CLIENT_ID));
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class InvalidClientIdError extends Error {
   constructor() {

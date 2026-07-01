@@ -7,7 +7,7 @@ import type { Pool } from "pg";
 import { z } from "zod";
 import { getDb } from "@/db";
 import { automationControl, agencyControl, adActions, actionAttempts, auditEvents, metricFetches, ads, creatives } from "@/db/schema";
-import { activeClientContext, getClient, type ClientContext } from "@/lib/clients";
+import { activeClientContext, getClient, UUID_RE, type ClientContext } from "@/lib/clients";
 import {
   evaluate, tierOf, ACTION_TYPES, type ActionType, type ProposedAction, type GuardrailContext,
 } from "./guardrails";
@@ -159,7 +159,7 @@ export interface ProposeInput {
 // are negative); projection is non-negative. Unknown keys rejected.
 export const ProposeInputSchema = z
   .object({
-    clientId: z.string().uuid(),
+    clientId: z.string().regex(UUID_RE, "invalid client id"),
     actionType: z.enum(ACTION_TYPES),
     entityType: z.enum(["account", "campaign", "adset", "ad"]),
     entityId: z.string().min(1).max(256),
