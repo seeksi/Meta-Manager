@@ -11,6 +11,7 @@ import { activeClientContext, getClient, UUID_RE, type ClientContext } from "@/l
 import {
   evaluate, tierOf, ACTION_TYPES, type ActionType, type ProposedAction, type GuardrailContext,
 } from "./guardrails";
+import { evaluateCompliance, collectStrings, type Reviewable } from "./compliance";
 import {
   applyAbsolutePatch, findByLaunchToken, createAdCreative, createAdObject, getDailyBudgetCents,
   fetchEnabledBudgets, fetchChildAdsetBudgets, getBudgetInfo,
@@ -173,7 +174,25 @@ export const ProposeInputSchema = z
   })
   .strict();
 
-/** Shared: load this client's control + freshness, build context, run guardrails. No DB writes. */
+// Only targeting-bearing actions carry a targeting surface for the personal-health-attribute rule;
+// everything else (pause/budget/launch) has an empty targeting object and only its copy is scanned.
+const TARGETING_ACTIONS = new Set<ActionType>(["change_targeting", "expand_audience"]);
+
+/** Normalize a proposal into the compliance surface: creative copy = the string leaves of the
+ *  proposed target + its audit rationale; targeting = the target object for targeting actions. */
+export function buildReviewable(input: ProposeInput): Reviewable {
+  const ev = (input.evidence ?? {}) as Record<string, unknown>;
+  const copy = collectStrings({
+    target: input.targetState,
+    auditFinding: ev.auditFinding,
+    rationale: ev.rationale,
+  }).join("\n");
+  const targeting = TARGETING_ACTIONS.has(input.actionType) ? input.targetState : {};
+  return { copy, targeting };
+}
+
+/** Shared: load this client's control + freshness, build context, run guardrails + compliance.
+ *  No DB writes. */
 async function prepare(input: ProposeInput) {
   const { control, ctx } = await buildGuardrailContext(input.clientId, {
     projectedDailySpendCents: input.projectedDailySpendCents ?? 0,
@@ -184,20 +203,24 @@ async function prepare(input: ProposeInput) {
     dailyBudgetDeltaCents: input.dailyBudgetDeltaCents ?? 0,
     dailyBudgetDeltaPct: input.dailyBudgetDeltaPct ?? 0,
   };
-  return { control, result: evaluate(action, ctx) };
+  const compliance = evaluateCompliance(buildReviewable(input));
+  return { control, result: evaluate(action, ctx), compliance };
 }
 
-/** Preview the guardrail decision without persisting — drives the editor preview. */
+/** Preview the guardrail + compliance decision without persisting — drives the editor preview. */
 export async function previewAction(input: ProposeInput) {
-  const { result } = await prepare(input);
-  return { result, tier: tierOf(input.actionType) };
+  const { result, compliance } = await prepare(input);
+  return { result, tier: tierOf(input.actionType), compliance };
 }
 
 /** Propose an action: evaluate guardrails, persist, audit, and auto-dispatch if allowed. */
 export async function proposeAction(input: ProposeInput) {
-  const { control, result } = await prepare(input);
+  const { control, result, compliance } = await prepare(input);
+  // Compliance BLOCK is a hard gate ABOVE the guardrail decision: it forces 'blocked' (never
+  // dispatched). PASS/FLAG leave the normal guardrail mapping intact (FLAG = annotate only).
   const status =
-    result.decision === "allow" ? "approved"            // Tier A within caps → ready
+    compliance.status === "block" ? "blocked"
+    : result.decision === "allow" ? "approved"          // Tier A within caps → ready
     : result.decision === "require_approval" ? "pending_approval"
     : "blocked";
 
@@ -215,6 +238,8 @@ export async function proposeAction(input: ProposeInput) {
     projectedDailySpendCents: input.projectedDailySpendCents ?? 0,
     evidence: input.evidence ?? null,
     guardrailResult: result,
+    complianceStatus: compliance.status,
+    complianceFindings: compliance.findings,
     policyVersion: control.activePolicyVersion,
     idempotencyKey,
     expiresAt: new Date(Date.now() + 24 * 3600_000),
@@ -228,6 +253,10 @@ export async function proposeAction(input: ProposeInput) {
   }
 
   await audit(input.clientId, input.actor ?? "system", "action.proposed", row.id, { status, result });
+  // Immutable rule-version trail (spec §5): every eval is audited with the active ruleset version.
+  await audit(input.clientId, input.actor ?? "system", "action.compliance_evaluated", row.id, {
+    status: compliance.status, version: control.activeComplianceVersion, findings: compliance.findings,
+  });
   if (status === "approved") await dispatch(row.id);
   return row;
 }
