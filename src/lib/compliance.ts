@@ -35,7 +35,9 @@ export interface ComplianceResult {
 
 // BLOCK · creative — personal "you/your body" before-after framing (the canonical Meta health-ad
 // rejection reason in PROCESS.html): personal-attribute address paired with before/after language.
-const PERSONAL_ATTR = /\byou(r)?\s+(body|face|skin|figure|weight|results|jawline|lips|wrinkles)\b/i;
+// Allow 0–2 adjectives between the possessive and the body-part noun so "your NEW body",
+// "your dream body", "your best skin" don't evade the rule (caught in the M4/M5 pipeline dry-run).
+const PERSONAL_ATTR = /\byou(r)?\s+(?:\w+\s+){0,2}(body|face|skin|figure|weight|results|jawline|lips|wrinkles)\b/i;
 const BEFORE_AFTER = /before\s*(?:[&/+.-]|and)?\s*after/i;
 
 // FLAG · creative — unsubstantiated results / medical-outcome claim without an FTC disclaimer.

@@ -19,6 +19,18 @@ describe("evaluateCompliance — med-spa ruleset (pure)", () => {
     expect(r.findings.some((f) => f.ruleId === "creative.personal_before_after")).toBe(true);
   });
 
+  it("BLOCKs before-after framing with adjectives between possessive and body-part", () => {
+    for (const copy of [
+      "See your new body — before & after",
+      "Your dream body, before and after",
+      "Reveal your best skin before/after",
+    ]) {
+      const r = evaluateCompliance(R({ copy }));
+      expect(r.status).toBe("block");
+      expect(r.findings.some((f) => f.ruleId === "creative.personal_before_after")).toBe(true);
+    }
+  });
+
   it("PASSes a general-benefit reworded creative", () => {
     const r = evaluateCompliance(R({ copy: "Feel refreshed and confident — book a consultation today." }));
     expect(r.status).toBe("pass");
