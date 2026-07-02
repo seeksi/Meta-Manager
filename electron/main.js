@@ -17,7 +17,10 @@ const root = path.join(__dirname, "..");
 let server; // Next.js child process
 
 function startServer() {
-  const env = { ...process.env, PORT, HOSTNAME: "127.0.0.1" };
+  // DESKTOP=1 tells the Next server it is the desktop build served over http://127.0.0.1, so it
+  // must NOT set the Secure cookie flag (a Secure cookie is silently dropped over http → login
+  // never sticks). All other production deploys default to Secure. See src/lib/auth.ts.
+  const env = { ...process.env, PORT, HOSTNAME: "127.0.0.1", DESKTOP: "1" };
   if (isDev) {
     server = spawn("npx", ["next", "dev", "-p", PORT], { cwd: root, env, stdio: "inherit", shell: true });
     server.on("exit", (code) => code && console.error(`[next] server exited with code ${code}`));
