@@ -1,11 +1,21 @@
 import { eq } from "drizzle-orm";
 import { getDb } from "@/db";
-import { ads, automationControl, clients, metaInsightsDaily } from "@/db/schema";
+import { ads, automationControl, metaInsightsDaily } from "@/db/schema";
 import { clientContext, getClient } from "@/lib/clients";
 import { detectFatigue, recentInsightRows, type FatigueRow } from "@/lib/fatigue";
-import { fetchEnabledBudgets } from "@/lib/meta/client";
+import {
+  fetchAccountReach,
+  fetchAdsWithCreative,
+  fetchAdsetsDetail,
+  fetchCampaigns,
+  fetchEnabledBudgets,
+  type AdCreativeRow,
+  type AdsetDetailRow,
+  type CampaignRow,
+  type MetaCtx,
+} from "@/lib/meta/client";
 
-export const AUDIT_ENGINE_VERSION = 1;
+export const AUDIT_ENGINE_VERSION = 2;
 
 export type AuditSeverity = "critical" | "warn" | "info";
 export type AuditCategory = "pixel_capi" | "creative" | "structure" | "audience";
@@ -248,7 +258,11 @@ export function checkCtrLow(totals: InsightTotals | null): AuditCheckResult {
   ));
 }
 
-export function checkCreativeFatigue(rows: FatigueRow[], hasInsightData: boolean): AuditCheckResult {
+export function checkCreativeFatigue(
+  rows: FatigueRow[],
+  hasInsightData: boolean,
+  activeCampaignCount: number | null = null,
+): AuditCheckResult {
   if (!hasInsightData) {
     return notAssessed(
       "creative-fatigue",
@@ -259,17 +273,20 @@ export function checkCreativeFatigue(rows: FatigueRow[], hasInsightData: boolean
     );
   }
   if (rows.length === 0) return pass("creative-fatigue", "creative");
-  // ponytail: use 3 flagged campaign rows as the M-A1 account-level ceiling; upgrade to
-  // percent-of-active-campaigns once campaign inventory reads land in M-A1.5.
-  const severity: AuditSeverity = rows.length >= 3 ? "critical" : "warn";
+  // >30% of active campaigns fatigued → critical; any fatigue → warn; none → pass. Without a live
+  // active-campaign denominator (fetchCampaigns unavailable) we can still flag any fatigue as a
+  // warn, but cannot escalate to critical.
+  const pct = activeCampaignCount && activeCampaignCount > 0 ? rows.length / activeCampaignCount : null;
+  const severity: AuditSeverity = pct !== null && pct > 0.3 ? "critical" : "warn";
+  const share = pct !== null ? ` (${Math.round(pct * 100)}% of ${activeCampaignCount} active campaigns)` : "";
   return assessedFinding(finding(
     "creative-fatigue",
     "creative",
     severity,
     severity === "critical" ? "Creative fatigue is broad" : "Creative fatigue detected",
-    `${rows.length} campaign${rows.length === 1 ? "" : "s"} show fatigue signals from stored insights.`,
+    `${rows.length} campaign${rows.length === 1 ? "" : "s"} show fatigue signals from stored insights${share}.`,
     "Refresh the affected creative angles and watch frequency/CTR before scaling.",
-    { fatigued: rows.slice(0, 10) },
+    { fatigued: rows.slice(0, 10), activeCampaignCount, pct },
     false,
   ));
 }
@@ -311,18 +328,278 @@ export function checkCopyLength(rows: AdCopyRow[]): AuditCheckResult | null {
   ));
 }
 
-// ponytail: a trustworthy 7-day cumulative frequency needs deduplicated period reach, which
-// summed daily reach cannot produce (Σimpr/Σreach collapses to average *daily* frequency). So M-A1
-// defers this check — it stays "not assessed" and drops from the score until M-A1.5 adds the live
-// period-reach Meta read. Upgrade path: fetch account reach over the window, then Σimpr/reach.
-export function checkFrequencyHigh(): AuditCheckResult {
-  return notAssessed(
-    "frequency-high",
-    "audience",
-    "Frequency not assessed (deferred to M-A1.5)",
-    "A trustworthy 7-day frequency needs deduplicated period reach, which stored daily rows cannot be summed to. Deferred until the M-A1.5 live reach read.",
-    "No action needed; frequency will be scored once M-A1.5 adds the period-reach read.",
-  );
+// Real 7-day account frequency from deduplicated period reach (impressions/reach). >5 → critical,
+// 3–5 → warn, <3 → pass. Needs the live period-reach read (fetchAccountReach); summed daily reach
+// cannot produce a valid period frequency, which is why M-A1 deferred this.
+export function checkFrequencyHigh(
+  reach: { impressions: number; reach: number } | null,
+  metaError?: string,
+): AuditCheckResult {
+  if (metaError) {
+    return notAssessed(
+      "frequency-high",
+      "audience",
+      "Frequency not assessed",
+      "The live read-only period-reach scan failed, so account frequency did not affect the score.",
+      "Confirm the Meta token/account connection (and insights scope) and rerun the audit.",
+      { error: metaError },
+    );
+  }
+  if (!reach || reach.reach <= 0) {
+    return notAssessed(
+      "frequency-high",
+      "audience",
+      "Frequency not assessed",
+      "No deduplicated period reach was returned, so 7-day frequency cannot be computed.",
+      "Confirm the account has recent delivery, then rerun the audit.",
+      reach,
+    );
+  }
+  const freq = reach.impressions / reach.reach;
+  if (freq > 5) {
+    return assessedFinding(finding(
+      "frequency-high",
+      "audience",
+      "critical",
+      "Frequency is critically high",
+      `7-day account frequency is ${freq.toFixed(2)}, above the 5.0 fail threshold — audience saturation.`,
+      "Expand or refresh audiences and rotate creative before spending more.",
+      { frequency: freq, ...reach },
+      false,
+    ));
+  }
+  if (freq >= 3) {
+    return assessedFinding(finding(
+      "frequency-high",
+      "audience",
+      "warn",
+      "Frequency is elevated",
+      `7-day account frequency is ${freq.toFixed(2)}; the pass threshold is below 3.0.`,
+      "Watch for fatigue and broaden audiences or refresh creative if CTR declines.",
+      { frequency: freq, ...reach },
+      false,
+    ));
+  }
+  return pass("frequency-high", "audience");
+}
+
+const ACTIVE_STATUS = "ACTIVE";
+
+export function checkCampaignCount(campaigns: CampaignRow[] | null, metaError?: string): AuditCheckResult {
+  if (metaError || !campaigns) {
+    return notAssessed(
+      "campaign-count",
+      "structure",
+      "Campaign count not assessed",
+      "The live read-only campaign list scan failed, so this check did not affect the score.",
+      "Confirm the Meta token/account connection (and ads_read scope) and rerun the audit.",
+      { error: metaError },
+    );
+  }
+  const active = campaigns.filter((c) => c.effectiveStatus === ACTIVE_STATUS);
+  if (active.length === 0) {
+    return notAssessed(
+      "campaign-count",
+      "structure",
+      "Campaign count not assessed",
+      "No active campaigns were returned by the read-only scan, so structure cannot be judged.",
+      "Confirm campaigns are active, then rerun the audit.",
+      { active: 0 },
+    );
+  }
+  if (active.length > 3) {
+    return assessedFinding(finding(
+      "campaign-count",
+      "structure",
+      "warn",
+      "Too many active campaigns",
+      `${active.length} campaigns are active; more than 3 fragments budget and slows learning.`,
+      "Consolidate into fewer active campaigns so budget and signal concentrate.",
+      { active: active.length },
+      false,
+    ));
+  }
+  return pass("campaign-count", "structure");
+}
+
+export function checkCboVsAbo(campaigns: CampaignRow[] | null, metaError?: string): AuditCheckResult {
+  if (metaError || !campaigns) {
+    return notAssessed(
+      "cbo-vs-abo",
+      "structure",
+      "Budget model not assessed",
+      "The live read-only campaign list scan failed, so CBO-vs-ABO could not be evaluated.",
+      "Confirm the Meta token/account connection (and ads_read scope) and rerun the audit.",
+      { error: metaError },
+    );
+  }
+  const active = campaigns.filter((c) => c.effectiveStatus === ACTIVE_STATUS);
+  if (active.length === 0) {
+    return notAssessed(
+      "cbo-vs-abo",
+      "structure",
+      "Budget model not assessed",
+      "No active campaigns were returned by the read-only scan.",
+      "Confirm campaigns are active, then rerun the audit.",
+      { active: 0 },
+    );
+  }
+  // A campaign carrying its own budget = CBO; one without = ABO (budget lives on its adsets).
+  const cbo = active.filter((c) => c.dailyCents != null || c.lifetimeCents != null).length;
+  const abo = active.length - cbo;
+  if (cbo > 0 && abo > 0) {
+    return assessedFinding(finding(
+      "cbo-vs-abo",
+      "structure",
+      "warn",
+      "Mixed CBO and ABO campaigns",
+      `${cbo} campaign${cbo === 1 ? " uses" : "s use"} campaign budget and ${abo} use${abo === 1 ? "s" : ""} ad-set budget.`,
+      "Standardize on one budget model (Advantage campaign budget is usually simpler to scale).",
+      { cbo, abo },
+      false,
+    ));
+  }
+  return pass("cbo-vs-abo", "structure");
+}
+
+export function checkLearningLimited(adsets: AdsetDetailRow[] | null, metaError?: string): AuditCheckResult {
+  if (metaError || !adsets) {
+    return notAssessed(
+      "learning-limited",
+      "structure",
+      "Learning stage not assessed",
+      "The live read-only adset scan failed, so learning-limited share could not be evaluated.",
+      "Confirm the Meta token/account connection (and ads_read scope) and rerun the audit.",
+      { error: metaError },
+    );
+  }
+  const active = adsets.filter((a) => a.effectiveStatus === ACTIVE_STATUS);
+  if (active.length === 0) {
+    return notAssessed(
+      "learning-limited",
+      "structure",
+      "Learning stage not assessed",
+      "No active ad sets were returned by the read-only scan.",
+      "Confirm ad sets are active, then rerun the audit.",
+      { active: 0 },
+    );
+  }
+  const limited = active.filter((a) => a.learningStage === "LEARNING_LIMITED");
+  const share = limited.length / active.length;
+  const evidence = { limited: limited.length, active: active.length, share };
+  if (share > 0.5) {
+    return assessedFinding(finding(
+      "learning-limited",
+      "structure",
+      "critical",
+      "Most ad sets are learning limited",
+      `${limited.length} of ${active.length} active ad sets (${Math.round(share * 100)}%) are learning limited.`,
+      "Consolidate ad sets and raise budget/events so learning can complete.",
+      evidence,
+      false,
+    ));
+  }
+  if (share > 0.2) {
+    return assessedFinding(finding(
+      "learning-limited",
+      "structure",
+      "warn",
+      "Several ad sets are learning limited",
+      `${limited.length} of ${active.length} active ad sets (${Math.round(share * 100)}%) are learning limited.`,
+      "Consolidate low-volume ad sets so each clears the learning threshold.",
+      evidence,
+      false,
+    ));
+  }
+  return pass("learning-limited", "structure");
+}
+
+function activeAdsByAdset(ads: AdCreativeRow[]): Map<string, AdCreativeRow[]> {
+  const byAdset = new Map<string, AdCreativeRow[]>();
+  for (const ad of ads) {
+    if (ad.effectiveStatus !== ACTIVE_STATUS) continue;
+    const key = ad.adsetId ?? "unknown";
+    const arr = byAdset.get(key) ?? [];
+    arr.push(ad);
+    byAdset.set(key, arr);
+  }
+  return byAdset;
+}
+
+export function checkFormatDiversity(ads: AdCreativeRow[] | null, metaError?: string): AuditCheckResult {
+  if (metaError || !ads) {
+    return notAssessed(
+      "format-diversity",
+      "creative",
+      "Format diversity not assessed",
+      "The live read-only ads/creatives scan failed, so format diversity could not be evaluated.",
+      "Confirm the Meta token/account connection (and ads_read scope) and rerun the audit.",
+      { error: metaError },
+    );
+  }
+  const byAdset = activeAdsByAdset(ads);
+  if (byAdset.size === 0) {
+    return notAssessed(
+      "format-diversity",
+      "creative",
+      "Format diversity not assessed",
+      "No active ads were returned by the read-only scan.",
+      "Confirm ads are active, then rerun the audit.",
+      { activeAdsets: 0 },
+    );
+  }
+  const thin = [...byAdset.entries()]
+    .map(([adsetId, group]) => ({ adsetId, formats: new Set(group.map((a) => a.format ?? "unknown")).size }))
+    .filter((row) => row.formats < 3);
+  if (thin.length === 0) return pass("format-diversity", "creative");
+  return assessedFinding(finding(
+    "format-diversity",
+    "creative",
+    "warn",
+    "Low creative format diversity",
+    `${thin.length} active ad set${thin.length === 1 ? "" : "s"} run fewer than 3 distinct creative formats.`,
+    "Add more creative formats per ad set (image, video, carousel) to feed retrieval.",
+    { thin: thin.slice(0, 10) },
+    false,
+  ));
+}
+
+export function checkCreativesPerAdset(ads: AdCreativeRow[] | null, metaError?: string): AuditCheckResult {
+  if (metaError || !ads) {
+    return notAssessed(
+      "creatives-per-adset",
+      "creative",
+      "Creatives per ad set not assessed",
+      "The live read-only ads/creatives scan failed, so ad count per ad set could not be evaluated.",
+      "Confirm the Meta token/account connection (and ads_read scope) and rerun the audit.",
+      { error: metaError },
+    );
+  }
+  const byAdset = activeAdsByAdset(ads);
+  if (byAdset.size === 0) {
+    return notAssessed(
+      "creatives-per-adset",
+      "creative",
+      "Creatives per ad set not assessed",
+      "No active ads were returned by the read-only scan.",
+      "Confirm ads are active, then rerun the audit.",
+      { activeAdsets: 0 },
+    );
+  }
+  const thin = [...byAdset.entries()]
+    .map(([adsetId, group]) => ({ adsetId, ads: group.length }))
+    .filter((row) => row.ads < 5);
+  if (thin.length === 0) return pass("creatives-per-adset", "creative");
+  return assessedFinding(finding(
+    "creatives-per-adset",
+    "creative",
+    "warn",
+    "Too few creatives per ad set",
+    `${thin.length} active ad set${thin.length === 1 ? "" : "s"} run fewer than 5 ads.`,
+    "Add creatives so each ad set has at least 5 ads for the system to optimize across.",
+    { thin: thin.slice(0, 10) },
+    false,
+  ));
 }
 
 export function checkBudgetVsCpa(args: {
@@ -482,6 +759,29 @@ async function appCreatedCopy(clientId: string): Promise<AdCopyRow[]> {
   return rows.filter((row) => row.copy !== null);
 }
 
+// Trailing 7-day window (today-6 … today) as YYYY-MM-DD, for the live period-reach read.
+function trailing7d(): [string, string] {
+  const until = new Date();
+  const since = new Date(until.getTime() - 6 * 86_400_000);
+  const fmt = (d: Date) => d.toISOString().slice(0, 10);
+  return [fmt(since), fmt(until)];
+}
+
+// Run one live Meta read, degrading to { error } instead of throwing. A null ctx (clientContext
+// failed) short-circuits to the ctx error so no read is attempted with a bad context.
+async function safeRead<T>(
+  ctx: MetaCtx | null,
+  ctxError: string | undefined,
+  fn: (ctx: MetaCtx) => Promise<T>,
+): Promise<{ data?: T; error?: string }> {
+  if (!ctx) return { error: ctxError ?? "Meta context unavailable" };
+  try {
+    return { data: await fn(ctx) };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 export async function runAudit(clientId: string, inputs: AuditInputs = {}): Promise<AuditReport> {
   const client = await getClient(clientId);
   if (!client) throw new Error(`unknown client: ${clientId}`);
@@ -495,19 +795,30 @@ export async function runAudit(clientId: string, inputs: AuditInputs = {}): Prom
   const insights = sumAccountInsights(windowRows);
   const hasCampaignData = windowRows.some((row) => row.entityType === "campaign");
 
-  let budgetInput: Parameters<typeof checkBudgetVsCpa>[0];
+  // Every live read degrades independently: a Meta/scope failure yields metaError → not_assessed,
+  // never a thrown run. clientContext failing degrades all live reads at once.
+  let ctx: MetaCtx | null = null;
+  let ctxError: string | undefined;
   try {
-    const ctx = await clientContext(clientId);
-    const budgets = await fetchEnabledBudgets(ctx);
-    budgetInput = { ...budgets, targetCpaCents: target };
+    ctx = await clientContext(clientId);
   } catch (e) {
-    budgetInput = {
-      daily: {},
-      hasLifetime: false,
-      targetCpaCents: target,
-      metaError: e instanceof Error ? e.message : String(e),
-    };
+    ctxError = e instanceof Error ? e.message : String(e);
   }
+
+  const [budgetsRead, campaignsRead, adsetsRead, adsRead, reachRead] = await Promise.all([
+    safeRead(ctx, ctxError, (c) => fetchEnabledBudgets(c)),
+    safeRead(ctx, ctxError, (c) => fetchCampaigns(c)),
+    safeRead(ctx, ctxError, (c) => fetchAdsetsDetail(c)),
+    safeRead(ctx, ctxError, (c) => fetchAdsWithCreative(c)),
+    safeRead(ctx, ctxError, (c) => fetchAccountReach(c, ...trailing7d())),
+  ]);
+
+  const budgetInput: Parameters<typeof checkBudgetVsCpa>[0] = budgetsRead.error
+    ? { daily: {}, hasLifetime: false, targetCpaCents: target, metaError: budgetsRead.error }
+    : { ...budgetsRead.data!, targetCpaCents: target };
+  const activeCampaigns = campaignsRead.data
+    ? campaignsRead.data.filter((c) => c.effectiveStatus === "ACTIVE").length
+    : null;
 
   return scoreAudit([
     checkPixelPresent(client.pixelId),
@@ -515,9 +826,14 @@ export async function runAudit(clientId: string, inputs: AuditInputs = {}): Prom
     checkEmqPurchase(inputs),
     checkLeadEventFiring(inputs),
     checkCtrLow(insights),
-    checkCreativeFatigue(fatigueRows, hasCampaignData),
+    checkCreativeFatigue(fatigueRows, hasCampaignData, activeCampaigns),
     checkCopyLength(copyRows),
-    checkFrequencyHigh(),
+    checkFrequencyHigh(reachRead.data ?? null, reachRead.error),
     checkBudgetVsCpa(budgetInput),
+    checkCampaignCount(campaignsRead.data ?? null, campaignsRead.error),
+    checkCboVsAbo(campaignsRead.data ?? null, campaignsRead.error),
+    checkLearningLimited(adsetsRead.data ?? null, adsetsRead.error),
+    checkFormatDiversity(adsRead.data ?? null, adsRead.error),
+    checkCreativesPerAdset(adsRead.data ?? null, adsRead.error),
   ]);
 }
