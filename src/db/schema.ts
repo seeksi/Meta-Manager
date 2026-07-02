@@ -184,6 +184,20 @@ export const auditEvents = pgTable(
   (t) => [index("ix_audit_created").on(t.createdAt), index("ix_audit_client").on(t.clientId)],
 );
 
+export const auditRuns = pgTable("audit_runs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  clientId: uuid("client_id").notNull().references(() => clients.id),
+  status: text("status").notNull().default("complete"),
+  trigger: text("trigger").notNull().default("manual"),
+  score: integer("score"),
+  engineVersion: integer("engine_version").notNull(),
+  summary: jsonb("summary"),
+  inputs: jsonb("inputs"),
+  findings: jsonb("findings").notNull().default([]),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
+}, (t) => [index("ix_audit_runs_client").on(t.clientId, t.startedAt.desc())]);
+
 export const schedulerRuns = pgTable(
   "scheduler_runs",
   {
@@ -278,7 +292,7 @@ export const experiments = pgTable("experiments", {
 export const schema = {
   operators, clients, agencyControl,
   metricFetches, metaInsightsDaily, metaInsightsHourly, metricRollupsDaily,
-  automationControl, adActions, actionAttempts, auditEvents, schedulerRuns, spendReservations,
+  automationControl, adActions, actionAttempts, auditEvents, auditRuns, schedulerRuns, spendReservations,
   creatives, ads, leads, competitorCreatives, experiments,
 };
 
