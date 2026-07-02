@@ -337,24 +337,26 @@ export async function fetchCampaigns(ctx: MetaCtx): Promise<CampaignRow[]> {
   return out;
 }
 
-export interface AdsetDetailRow { id: string; effectiveStatus?: string; learningStage?: string; targeting?: unknown }
+export interface AdsetDetailRow { id: string; effectiveStatus?: string; learningStage?: string }
 
-/** Adsets with learning stage + a light targeting surface → learning-limited % + audience basics. */
+/** Adsets with learning stage → learning-limited %. (ponytail: add a targeting surface here when an
+ *  audience-basics check that consumes it lands — omitted now per YAGNI; targeting objects are heavy
+ *  per adset.) */
 export async function fetchAdsetsDetail(ctx: MetaCtx): Promise<AdsetDetailRow[]> {
   const out: AdsetDetailRow[] = [];
   let after: string | undefined;
   let pages = 0;
   do {
     const q: Record<string, string | number> = {
-      fields: "id,effective_status,configured_status,targeting,learning_stage_info", limit: 200,
+      fields: "id,effective_status,learning_stage_info", limit: 200,
     };
     if (after) q.after = after;
-    const res = await graph<{ data: { id: string; effective_status?: string; targeting?: unknown; learning_stage_info?: { status?: string } }[]; paging?: { next?: string; cursors?: { after?: string } } }>(
+    const res = await graph<{ data: { id: string; effective_status?: string; learning_stage_info?: { status?: string } }[]; paging?: { next?: string; cursors?: { after?: string } } }>(
       `${acctPath(ctx.accountId)}/adsets`, q, "GET", true, ctx.token,
     );
     for (const a of res.data) out.push({
       id: a.id, effectiveStatus: a.effective_status,
-      learningStage: a.learning_stage_info?.status, targeting: a.targeting,
+      learningStage: a.learning_stage_info?.status,
     });
     after = nextCursor(res.paging, "/adsets");
     pages++;

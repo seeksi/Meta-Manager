@@ -109,8 +109,9 @@ describe("audit pure checks", () => {
     expect(checkCreativeFatigue([], true, 4).status).toBe("pass"); // 0% fatigued
     expect(checkCreativeFatigue([fatigueRow("c1")], true, 4).status).toBe("warn"); // 1 of 4 = 25%
     expect(checkCreativeFatigue([fatigueRow("c1"), fatigueRow("c2")], true, 4).status).toBe("critical"); // 2 of 4 = 50% > 30%
-    // without a denominator any fatigue is at most a warn (cannot escalate to critical)
+    // without a denominator it falls back to a count ceiling: <3 warn, ≥3 critical
     expect(checkCreativeFatigue([fatigueRow("c1"), fatigueRow("c2")], true, null).status).toBe("warn");
+    expect(checkCreativeFatigue([fatigueRow("c1"), fatigueRow("c2"), fatigueRow("c3")], true, null).status).toBe("critical");
   });
 
   it("scores app-created copy length and non-applicable empty rows", () => {
@@ -127,6 +128,7 @@ describe("audit pure checks", () => {
     expect(checkFrequencyHigh({ impressions: 5_000, reach: 1_000 }).status).toBe("warn");
     expect(checkFrequencyHigh({ impressions: 5_100, reach: 1_000 }).status).toBe("critical");
     expect(checkFrequencyHigh({ impressions: 100, reach: 0 }).status).toBe("not_assessed");
+    expect(checkFrequencyHigh({ impressions: NaN, reach: 1_000 }).status).toBe("not_assessed"); // non-numeric → not a false pass
     expect(checkFrequencyHigh(null).status).toBe("not_assessed");
     expect(checkFrequencyHigh(null, "token").status).toBe("not_assessed");
   });

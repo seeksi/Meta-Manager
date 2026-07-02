@@ -273,12 +273,15 @@ export function checkCreativeFatigue(
     );
   }
   if (rows.length === 0) return pass("creative-fatigue", "creative");
-  // >30% of active campaigns fatigued → critical; any fatigue → warn; none → pass. Without a live
-  // active-campaign denominator (fetchCampaigns unavailable) we can still flag any fatigue as a
-  // warn, but cannot escalate to critical.
+  // >30% of active campaigns fatigued → critical; any fatigue → warn; none → pass. When the live
+  // active-campaign denominator is unavailable (fetchCampaigns failed / no active campaigns) fall
+  // back to an absolute-count ceiling (≥3 fatigued campaigns → critical) so a broadly-fatigued
+  // account still escalates instead of being capped at warn.
   const pct = activeCampaignCount && activeCampaignCount > 0 ? rows.length / activeCampaignCount : null;
-  const severity: AuditSeverity = pct !== null && pct > 0.3 ? "critical" : "warn";
-  const share = pct !== null ? ` (${Math.round(pct * 100)}% of ${activeCampaignCount} active campaigns)` : "";
+  const severity: AuditSeverity = pct !== null
+    ? (pct > 0.3 ? "critical" : "warn")
+    : (rows.length >= 3 ? "critical" : "warn");
+  const share = pct !== null ? ` (${Math.round(Math.min(pct, 1) * 100)}% of ${activeCampaignCount} active campaigns)` : "";
   return assessedFinding(finding(
     "creative-fatigue",
     "creative",
@@ -356,6 +359,16 @@ export function checkFrequencyHigh(
     );
   }
   const freq = reach.impressions / reach.reach;
+  if (!Number.isFinite(freq)) {
+    return notAssessed(
+      "frequency-high",
+      "audience",
+      "Frequency not assessed",
+      "Period reach returned non-numeric impressions/reach, so frequency could not be computed.",
+      "Confirm the account has valid recent delivery, then rerun the audit.",
+      reach,
+    );
+  }
   if (freq > 5) {
     return assessedFinding(finding(
       "frequency-high",
@@ -817,7 +830,7 @@ export async function runAudit(clientId: string, inputs: AuditInputs = {}): Prom
     ? { daily: {}, hasLifetime: false, targetCpaCents: target, metaError: budgetsRead.error }
     : { ...budgetsRead.data!, targetCpaCents: target };
   const activeCampaigns = campaignsRead.data
-    ? campaignsRead.data.filter((c) => c.effectiveStatus === "ACTIVE").length
+    ? campaignsRead.data.filter((c) => c.effectiveStatus === ACTIVE_STATUS).length
     : null;
 
   return scoreAudit([
