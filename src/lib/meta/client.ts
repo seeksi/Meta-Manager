@@ -302,6 +302,113 @@ export async function fetchChildAdsetBudgets(ctx: MetaCtx, campaignId: string): 
   return { dailyCents, hasLifetime };
 }
 
+// ── Read-only inventory reads (M-A1.5 audit engine) ────────────────────────────
+// All GET, all paginated with the same nextCursor / fail-closed-on-truncation idiom as
+// scanEdgeBudgets. No scoring here — the audit engine scores the plain rows.
+
+export interface CampaignRow {
+  id: string; name?: string; effectiveStatus?: string;
+  dailyCents: number | null; lifetimeCents: number | null; objective?: string;
+}
+
+/** Campaign list → campaign-count + CBO-vs-ABO (a campaign carrying its own budget = CBO). */
+export async function fetchCampaigns(ctx: MetaCtx): Promise<CampaignRow[]> {
+  const out: CampaignRow[] = [];
+  let after: string | undefined;
+  let pages = 0;
+  do {
+    const q: Record<string, string | number> = {
+      fields: "id,name,effective_status,daily_budget,lifetime_budget,objective", limit: 200,
+    };
+    if (after) q.after = after;
+    const res = await graph<{ data: { id: string; name?: string; effective_status?: string; daily_budget?: string; lifetime_budget?: string; objective?: string }[]; paging?: { next?: string; cursors?: { after?: string } } }>(
+      `${acctPath(ctx.accountId)}/campaigns`, q, "GET", true, ctx.token,
+    );
+    for (const c of res.data) out.push({
+      id: c.id, name: c.name, effectiveStatus: c.effective_status,
+      dailyCents: c.daily_budget ? Number(c.daily_budget) : null,
+      lifetimeCents: c.lifetime_budget ? Number(c.lifetime_budget) : null,
+      objective: c.objective,
+    });
+    after = nextCursor(res.paging, "/campaigns");
+    pages++;
+  } while (after && pages < 20);
+  if (after) throw new MetaApiError(-2, undefined, "campaign list truncated (too many campaigns)");
+  return out;
+}
+
+export interface AdsetDetailRow { id: string; effectiveStatus?: string; learningStage?: string }
+
+/** Adsets with learning stage → learning-limited %. (ponytail: add a targeting surface here when an
+ *  audience-basics check that consumes it lands — omitted now per YAGNI; targeting objects are heavy
+ *  per adset.) */
+export async function fetchAdsetsDetail(ctx: MetaCtx): Promise<AdsetDetailRow[]> {
+  const out: AdsetDetailRow[] = [];
+  let after: string | undefined;
+  let pages = 0;
+  do {
+    const q: Record<string, string | number> = {
+      fields: "id,effective_status,learning_stage_info", limit: 200,
+    };
+    if (after) q.after = after;
+    const res = await graph<{ data: { id: string; effective_status?: string; learning_stage_info?: { status?: string } }[]; paging?: { next?: string; cursors?: { after?: string } } }>(
+      `${acctPath(ctx.accountId)}/adsets`, q, "GET", true, ctx.token,
+    );
+    for (const a of res.data) out.push({
+      id: a.id, effectiveStatus: a.effective_status,
+      learningStage: a.learning_stage_info?.status,
+    });
+    after = nextCursor(res.paging, "/adsets");
+    pages++;
+  } while (after && pages < 20);
+  if (after) throw new MetaApiError(-2, undefined, "adset detail scan truncated (too many adsets)");
+  return out;
+}
+
+export interface AdCreativeRow { id: string; adsetId?: string; effectiveStatus?: string; format?: string }
+
+/** Ads + their creative → format diversity (distinct formats/adset) + creatives-per-adset count.
+ *  ponytail: format is proxied from creative.object_type; upgrade to asset_feed_spec ad_formats
+ *  for DCO-aware diversity in M-A4. */
+export async function fetchAdsWithCreative(ctx: MetaCtx): Promise<AdCreativeRow[]> {
+  const out: AdCreativeRow[] = [];
+  let after: string | undefined;
+  let pages = 0;
+  do {
+    const q: Record<string, string | number> = {
+      fields: "id,adset_id,effective_status,creative{object_type,asset_feed_spec}", limit: 200,
+    };
+    if (after) q.after = after;
+    const res = await graph<{ data: { id: string; adset_id?: string; effective_status?: string; creative?: { object_type?: string; asset_feed_spec?: unknown } }[]; paging?: { next?: string; cursors?: { after?: string } } }>(
+      `${acctPath(ctx.accountId)}/ads`, q, "GET", true, ctx.token,
+    );
+    for (const ad of res.data) out.push({
+      id: ad.id, adsetId: ad.adset_id, effectiveStatus: ad.effective_status,
+      format: ad.creative?.object_type ?? (ad.creative?.asset_feed_spec ? "DCO" : undefined),
+    });
+    after = nextCursor(res.paging, "/ads");
+    pages++;
+  } while (after && pages < 20);
+  if (after) throw new MetaApiError(-2, undefined, "ads-with-creative scan truncated (too many ads)");
+  return out;
+}
+
+/** Deduplicated PERIOD reach (NO time_increment → one aggregated row) → real 7-day account
+ *  frequency (impressions/reach). Summed daily reach is NOT a valid period reach — this is why
+ *  M-A1's frequency check was deferred. */
+export async function fetchAccountReach(ctx: MetaCtx, since: string, until: string): Promise<{ impressions: number; reach: number }> {
+  const page = await graph<{ data: { impressions?: string; reach?: string }[] }>(
+    `${acctPath(ctx.accountId)}/insights`, {
+      level: "account",
+      fields: "impressions,reach",
+      time_range: JSON.stringify({ since, until }), // OMIT time_increment → single period row
+      limit: 1,
+    }, "GET", true, ctx.token,
+  );
+  const row = page.data[0];
+  return { impressions: Number(row?.impressions ?? 0), reach: Number(row?.reach ?? 0) };
+}
+
 export async function applyAbsolutePatch(ctx: MetaCtx, patch: AbsolutePatch): Promise<ApplyResult> {
   // POST to /{object_id} with the absolute fields. daily_budget is in minor units (cents).
   const params: Record<string, string | number> = {};
