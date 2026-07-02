@@ -15,7 +15,7 @@ vi.mock("@/db", async () => {
 });
 
 import { clients, operators } from "@/db/schema";
-import { checkCredentials, signSession, verifySession } from "@/lib/auth";
+import { checkCredentials, sessionCookieOptions, signSession, verifySession } from "@/lib/auth";
 import { clientOwnedBy } from "@/lib/clients";
 
 const originalEnv = {
@@ -98,6 +98,38 @@ describe("operator credential checks", () => {
     delete process.env.OPERATOR_PASSWORD;
     delete process.env.SESSION_SECRET;
     await expect(checkCredentials("operator", "correct-password")).resolves.toBe(false);
+  });
+});
+
+describe("sessionCookieOptions secure flag (fail-secure)", () => {
+  const COOKIE_KEYS = ["HOSTED", "NODE_ENV", "DESKTOP"] as const;
+  const savedCookieEnv = Object.fromEntries(COOKIE_KEYS.map((k) => [k, process.env[k]]));
+  function setCookieEnv(env: Partial<Record<(typeof COOKIE_KEYS)[number], string | undefined>>) {
+    for (const k of COOKIE_KEYS) {
+      if (env[k] === undefined) delete process.env[k];
+      else process.env[k] = env[k];
+    }
+  }
+  afterEach(() => setCookieEnv(savedCookieEnv));
+
+  it("sets Secure on the hosted HTTPS deploy", () => {
+    setCookieEnv({ HOSTED: "1", NODE_ENV: "production", DESKTOP: undefined });
+    expect(sessionCookieOptions().secure).toBe(true);
+  });
+
+  it("sets Secure on a production HTTPS host even without HOSTED (the regression)", () => {
+    setCookieEnv({ HOSTED: undefined, NODE_ENV: "production", DESKTOP: undefined });
+    expect(sessionCookieOptions().secure).toBe(true);
+  });
+
+  it("does NOT set Secure for the desktop build over http://127.0.0.1", () => {
+    setCookieEnv({ HOSTED: undefined, NODE_ENV: "production", DESKTOP: "1" });
+    expect(sessionCookieOptions().secure).toBe(false);
+  });
+
+  it("does NOT set Secure in local dev over http", () => {
+    setCookieEnv({ HOSTED: undefined, NODE_ENV: "development", DESKTOP: undefined });
+    expect(sessionCookieOptions().secure).toBe(false);
   });
 });
 

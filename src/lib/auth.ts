@@ -14,7 +14,14 @@ export function sessionCookieOptions() {
   return {
     httpOnly: true,
     sameSite: "lax" as const,
-    secure: process.env.HOSTED === "1" || process.env.NODE_ENV === "production",
+    // Fail secure: set Secure on every production deployment EXCEPT the desktop build, which serves
+    // NODE_ENV=production over http://127.0.0.1 where a Secure cookie is silently dropped by the
+    // client (login returns ok:true but the session never sticks, bouncing back to /login). The
+    // electron shell stamps DESKTOP=1 on the Next server env (electron/main.js) to opt out; hosted
+    // HTTPS deploys (HOSTED=1 or any other prod host) keep Secure on. Do NOT gate on HOSTED alone —
+    // that would ship an insecure cookie on any HTTPS host that hasn't set HOSTED=1.
+    secure: (process.env.HOSTED === "1" || process.env.NODE_ENV === "production")
+      && process.env.DESKTOP !== "1",
     path: "/",
   };
 }
