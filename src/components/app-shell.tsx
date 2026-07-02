@@ -13,6 +13,7 @@ const NAV = [
   { href: "/research", label: "Research" },
   { href: "/leads", label: "Leads" },
   { href: "/optimize", label: "Optimize" },
+  { href: "/audit", label: "Audit" },
   { href: "/experiments", label: "Experiments" },
   { href: "/automation", label: "Automation" },
   { href: "/settings/setup", label: "Settings" },

@@ -55,19 +55,23 @@ export function scoreFatigue(points: DailyPoint[], cfg: FatigueConfig = DEFAULT_
 
 export interface FatigueRow extends FatigueSignal { entityId: string }
 
-export async function detectFatigue(clientId: string, cfg: FatigueConfig = DEFAULT_FATIGUE): Promise<FatigueRow[]> {
+/** All stored daily-insight rows for an account over the trailing 7-day window (latest stored day
+ *  minus 6). Single-sources the window so detectFatigue and the audit engine stay in lockstep. */
+export async function recentInsightRows(accountId: string) {
   const db = getDb();
-  const client = await getClient(clientId);
-  if (!client) return [];
-  const accountId = client.metaAccountId;
   const [latest] = await db.select({ day: metaInsightsDaily.dateStart })
     .from(metaInsightsDaily).where(eq(metaInsightsDaily.metaAccountId, accountId))
     .orderBy(desc(metaInsightsDaily.dateStart)).limit(1);
   if (!latest) return [];
-
   const start = new Date(new Date(latest.day).getTime() - 6 * 86_400_000).toISOString().slice(0, 10);
-  const rows = await db.select().from(metaInsightsDaily)
+  return db.select().from(metaInsightsDaily)
     .where(and(eq(metaInsightsDaily.metaAccountId, accountId), gte(metaInsightsDaily.dateStart, start)));
+}
+
+export async function detectFatigue(clientId: string, cfg: FatigueConfig = DEFAULT_FATIGUE): Promise<FatigueRow[]> {
+  const client = await getClient(clientId);
+  if (!client) return [];
+  const rows = await recentInsightRows(client.metaAccountId);
 
   const byEntity = new Map<string, DailyPoint[]>();
   for (const r of rows.filter((x) => x.entityType === "campaign")) {
