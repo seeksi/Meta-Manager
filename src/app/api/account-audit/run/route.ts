@@ -12,7 +12,6 @@ const AuditInputsSchema = z.object({
   capiEnabled: z.boolean().optional(),
   emqPurchase: z.number().min(0).max(10).optional(),
   leadEventFiring: z.boolean().optional(),
-  dedupRate: z.number().min(0).max(1).optional(),
 }).strict();
 
 const RunBodySchema = z.object({

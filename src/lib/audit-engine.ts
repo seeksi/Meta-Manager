@@ -1,8 +1,8 @@
-import { and, desc, eq, gte } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { getDb } from "@/db";
 import { ads, automationControl, clients, metaInsightsDaily } from "@/db/schema";
 import { clientContext, getClient } from "@/lib/clients";
-import { detectFatigue, type FatigueRow } from "@/lib/fatigue";
+import { detectFatigue, recentInsightRows, type FatigueRow } from "@/lib/fatigue";
 import { fetchEnabledBudgets } from "@/lib/meta/client";
 
 export const AUDIT_ENGINE_VERSION = 1;
@@ -26,7 +26,6 @@ export interface AuditInputs {
   capiEnabled?: boolean;
   emqPurchase?: number;
   leadEventFiring?: boolean;
-  dedupRate?: number;
 }
 
 export interface AuditReport {
@@ -249,7 +248,16 @@ export function checkCtrLow(totals: InsightTotals | null): AuditCheckResult {
   ));
 }
 
-export function checkCreativeFatigue(rows: FatigueRow[]): AuditCheckResult {
+export function checkCreativeFatigue(rows: FatigueRow[], hasInsightData: boolean): AuditCheckResult {
+  if (!hasInsightData) {
+    return notAssessed(
+      "creative-fatigue",
+      "creative",
+      "Creative fatigue not assessed",
+      "No stored campaign insights are available, so creative fatigue cannot be evaluated.",
+      "Ingest campaign-level insights, then rerun the audit.",
+    );
+  }
   if (rows.length === 0) return pass("creative-fatigue", "creative");
   // ponytail: use 3 flagged campaign rows as the M-A1 account-level ceiling; upgrade to
   // percent-of-active-campaigns once campaign inventory reads land in M-A1.5.
@@ -303,43 +311,18 @@ export function checkCopyLength(rows: AdCopyRow[]): AuditCheckResult | null {
   ));
 }
 
-export function checkFrequencyHigh(totals: InsightTotals | null): AuditCheckResult {
-  if (!totals || totals.impressions <= 0 || totals.reach <= 0) {
-    return notAssessed(
-      "frequency-high",
-      "audience",
-      "Frequency not assessed",
-      "No 7-day account reach/impression data is available in stored Meta insights.",
-      "Ingest account-level insights with reach, then rerun the audit.",
-      totals,
-    );
-  }
-  const frequency = totals.impressions / totals.reach;
-  if (frequency > 5) {
-    return assessedFinding(finding(
-      "frequency-high",
-      "audience",
-      "critical",
-      "Frequency is too high",
-      `7-day account frequency is ${frequency.toFixed(2)}, above the >5 fail threshold.`,
-      "Refresh creative and widen or rotate audience exposure before adding spend.",
-      { frequency, impressions: totals.impressions, reach: totals.reach },
-      false,
-    ));
-  }
-  if (frequency >= 3) {
-    return assessedFinding(finding(
-      "frequency-high",
-      "audience",
-      "warn",
-      "Frequency is elevated",
-      `7-day account frequency is ${frequency.toFixed(2)}; warning range is 3 to 5.`,
-      "Monitor fatigue and prepare creative or audience rotation.",
-      { frequency, impressions: totals.impressions, reach: totals.reach },
-      false,
-    ));
-  }
-  return pass("frequency-high", "audience");
+// ponytail: a trustworthy 7-day cumulative frequency needs deduplicated period reach, which
+// summed daily reach cannot produce (Σimpr/Σreach collapses to average *daily* frequency). So M-A1
+// defers this check — it stays "not assessed" and drops from the score until M-A1.5 adds the live
+// period-reach Meta read. Upgrade path: fetch account reach over the window, then Σimpr/reach.
+export function checkFrequencyHigh(): AuditCheckResult {
+  return notAssessed(
+    "frequency-high",
+    "audience",
+    "Frequency not assessed (deferred to M-A1.5)",
+    "A trustworthy 7-day frequency needs deduplicated period reach, which stored daily rows cannot be summed to. Deferred until the M-A1.5 live reach read.",
+    "No action needed; frequency will be scored once M-A1.5 adds the period-reach read.",
+  );
 }
 
 export function checkBudgetVsCpa(args: {
@@ -451,7 +434,9 @@ export function scoreAudit(checks: Array<AuditCheckResult | null>): AuditReport 
     }
   }
 
-  const findings = results.flatMap((check) => check.finding ? [check.finding] : []);
+  // Only assessed warn/critical checks are real findings; not_assessed checks carry an info
+  // placeholder that belongs in `notAssessed`/the summary chip, not the findings list.
+  const findings = results.filter(isFixFinding).map((check) => check.finding!);
   const assessed = results.filter(isAssessed).map((check) => check.code);
   const notAssessedCodes = results.filter((check) => check.status === "not_assessed").map((check) => check.code);
   const topFixes = results
@@ -482,20 +467,6 @@ function sumAccountInsights(rows: Array<typeof metaInsightsDaily.$inferSelect>):
   }), { impressions: 0, reach: 0, clicks: 0, days });
 }
 
-async function recentInsights(metaAccountId: string): Promise<InsightTotals | null> {
-  const db = getDb();
-  const [latest] = await db.select({ day: metaInsightsDaily.dateStart })
-    .from(metaInsightsDaily)
-    .where(eq(metaInsightsDaily.metaAccountId, metaAccountId))
-    .orderBy(desc(metaInsightsDaily.dateStart))
-    .limit(1);
-  if (!latest) return null;
-  const start = new Date(new Date(latest.day).getTime() - 6 * 86_400_000).toISOString().slice(0, 10);
-  const rows = await db.select().from(metaInsightsDaily)
-    .where(and(eq(metaInsightsDaily.metaAccountId, metaAccountId), gte(metaInsightsDaily.dateStart, start)));
-  return sumAccountInsights(rows);
-}
-
 async function targetCpaCents(clientId: string): Promise<number | null> {
   const [row] = await getDb().select({ targetCpaCents: automationControl.targetCpaCents })
     .from(automationControl)
@@ -515,12 +486,14 @@ export async function runAudit(clientId: string, inputs: AuditInputs = {}): Prom
   const client = await getClient(clientId);
   if (!client) throw new Error(`unknown client: ${clientId}`);
 
-  const [insights, fatigueRows, copyRows, target] = await Promise.all([
-    recentInsights(client.metaAccountId),
+  const [windowRows, fatigueRows, copyRows, target] = await Promise.all([
+    recentInsightRows(client.metaAccountId),
     detectFatigue(clientId),
     appCreatedCopy(clientId),
     targetCpaCents(clientId),
   ]);
+  const insights = sumAccountInsights(windowRows);
+  const hasCampaignData = windowRows.some((row) => row.entityType === "campaign");
 
   let budgetInput: Parameters<typeof checkBudgetVsCpa>[0];
   try {
@@ -542,9 +515,9 @@ export async function runAudit(clientId: string, inputs: AuditInputs = {}): Prom
     checkEmqPurchase(inputs),
     checkLeadEventFiring(inputs),
     checkCtrLow(insights),
-    checkCreativeFatigue(fatigueRows),
+    checkCreativeFatigue(fatigueRows, hasCampaignData),
     checkCopyLength(copyRows),
-    checkFrequencyHigh(insights),
+    checkFrequencyHigh(),
     checkBudgetVsCpa(budgetInput),
   ]);
 }

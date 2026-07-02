@@ -86,10 +86,11 @@ describe("audit pure checks", () => {
     expect(checkCtrLow(null).status).toBe("not_assessed");
   });
 
-  it("scores creative fatigue boundaries", () => {
-    expect(checkCreativeFatigue([]).status).toBe("pass");
-    expect(checkCreativeFatigue([fatigueRow("c1")]).status).toBe("warn");
-    expect(checkCreativeFatigue([fatigueRow("c1"), fatigueRow("c2"), fatigueRow("c3")]).status).toBe("critical");
+  it("scores creative fatigue boundaries and defers when there is no insight data", () => {
+    expect(checkCreativeFatigue([], false).status).toBe("not_assessed");
+    expect(checkCreativeFatigue([], true).status).toBe("pass");
+    expect(checkCreativeFatigue([fatigueRow("c1")], true).status).toBe("warn");
+    expect(checkCreativeFatigue([fatigueRow("c1"), fatigueRow("c2"), fatigueRow("c3")], true).status).toBe("critical");
   });
 
   it("scores app-created copy length and non-applicable empty rows", () => {
@@ -99,12 +100,8 @@ describe("audit pure checks", () => {
     expect(checkCopyLength([{ id: "ad1", copy: { headline: "Short", primaryText: "x".repeat(126) } }])?.status).toBe("warn");
   });
 
-  it("scores frequency thresholds", () => {
-    expect(checkFrequencyHigh({ impressions: 299, reach: 100, clicks: 20, days: 7 }).status).toBe("pass");
-    expect(checkFrequencyHigh({ impressions: 300, reach: 100, clicks: 20, days: 7 }).status).toBe("warn");
-    expect(checkFrequencyHigh({ impressions: 500, reach: 100, clicks: 20, days: 7 }).status).toBe("warn");
-    expect(checkFrequencyHigh({ impressions: 501, reach: 100, clicks: 20, days: 7 }).status).toBe("critical");
-    expect(checkFrequencyHigh(null).status).toBe("not_assessed");
+  it("defers frequency to a live period-reach read (M-A1.5)", () => {
+    expect(checkFrequencyHigh().status).toBe("not_assessed");
   });
 
   it("scores budget versus CPA boundaries and skips unsafe live-read states", () => {
@@ -124,16 +121,19 @@ describe("audit scoring", () => {
       checkEmqPurchase({}),
       checkLeadEventFiring({}),
       checkCtrLow({ impressions: 10_000, reach: 8_000, clicks: 100, days: 7 }),
-      checkCreativeFatigue([]),
-      checkFrequencyHigh({ impressions: 300, reach: 100, clicks: 20, days: 7 }),
+      checkCreativeFatigue([], true),
+      checkFrequencyHigh(),
       checkBudgetVsCpa({ daily: {}, hasLifetime: true, targetCpaCents: 1_000 }),
     ]);
 
     expect(report.version).toBe(AUDIT_ENGINE_VERSION);
-    expect(report.score).toBe(88);
-    expect(report.assessed).toEqual(["pixel-present", "ctr-low", "creative-fatigue", "frequency-high"]);
-    expect(report.notAssessed).toEqual(["capi-enabled", "emq-purchase", "lead-event-firing", "budget-vs-cpa"]);
+    expect(report.score).toBe(100);
+    expect(report.assessed).toEqual(["pixel-present", "ctr-low", "creative-fatigue"]);
+    expect(report.notAssessed).toEqual(["capi-enabled", "emq-purchase", "lead-event-firing", "frequency-high", "budget-vs-cpa"]);
     expect(summary(report).byCategory.structure.assessed).toBe(0);
+    expect(summary(report).byCategory.audience.assessed).toBe(0);
+    // not_assessed checks must not leak into the findings list
+    expect(report.findings.every((f) => f.severity !== "info")).toBe(true);
   });
 });
 
@@ -154,7 +154,9 @@ describe("runAudit", () => {
     expect(report.version).toBe(AUDIT_ENGINE_VERSION);
     expect(report.notAssessed).toContain("ctr-low");
     expect(report.notAssessed).toContain("frequency-high");
-    expect(report.findings.some((f) => f.code === "ctr-low" && f.severity === "info")).toBe(true);
+    expect(report.notAssessed).toContain("creative-fatigue");
+    // not_assessed checks stay out of findings; only real warn/critical findings appear there
+    expect(report.findings.every((f) => f.severity !== "info")).toBe(true);
   });
 });
 

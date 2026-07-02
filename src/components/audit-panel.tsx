@@ -2,20 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Card, KpiCard } from "@/components/ui";
-
-type Severity = "critical" | "warn" | "info";
-type Category = "pixel_capi" | "creative" | "structure" | "audience";
-
-interface AuditFinding {
-  code: string;
-  category: Category;
-  severity: Severity;
-  title: string;
-  detail: string;
-  recommendation: string;
-  evidence?: unknown;
-  autoFixable: boolean;
-}
+import type { AuditFinding, AuditCategory as Category, AuditSeverity as Severity } from "@/lib/audit-engine";
 
 interface AuditRun {
   id: string;
@@ -66,8 +53,9 @@ export function AuditPanel({ clientId }: { clientId: string }) {
       const res = await fetch(`/api/account-audit/runs?${clientQuery}`);
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error ?? "Could not load audit runs");
-      setRun(data.runs?.[0] ?? null);
-      setError(null);
+      const latest = data.runs?.[0] ?? null;
+      setRun(latest);
+      setError(runFailureMessage(latest));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -86,7 +74,10 @@ export function AuditPanel({ clientId }: { clientId: string }) {
       });
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error ?? "Audit failed");
+      // The route returns 200 with status:"failed" on an engine error so the run is recorded;
+      // surface that instead of rendering it as a clean, empty audit.
       setRun(data.run);
+      setError(runFailureMessage(data.run));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -144,7 +135,7 @@ export function AuditPanel({ clientId }: { clientId: string }) {
         <KpiCard label="Score" value={run?.score === null || !run ? "—" : `${run.score}/100`} hint={run ? `v${run.engineVersion} · ${run.status}` : "No run yet"} />
         <KpiCard label="Critical" value={String(severityCounts.critical)} />
         <KpiCard label="Warnings" value={String(severityCounts.warn)} />
-        <KpiCard label="Info" value={String(severityCounts.info)} />
+        <KpiCard label="Not assessed" value={String(notAssessed.length)} />
       </div>
 
       {notAssessed.length > 0 && (
@@ -229,8 +220,19 @@ function questionnaireInputs(capiEnabled: string, leadEventFiring: string, emqPu
   if (capiEnabled) inputs.capiEnabled = capiEnabled === "true";
   if (leadEventFiring) inputs.leadEventFiring = leadEventFiring === "true";
   const emq = Number(emqPurchase);
-  if (emqPurchase.trim() !== "" && Number.isFinite(emq)) inputs.emqPurchase = emq;
+  // EMQ is 0-10; drop an out-of-range value (treat as "unknown") rather than let it 400 the
+  // whole audit — one mistyped optional field shouldn't block the read-only run.
+  if (emqPurchase.trim() !== "" && Number.isFinite(emq) && emq >= 0 && emq <= 10) inputs.emqPurchase = emq;
   return inputs;
+}
+
+function runFailureMessage(run: AuditRun | null): string | null {
+  if (!run || run.status !== "failed") return null;
+  const summary = run.summary;
+  const detail = summary && typeof summary === "object" && "error" in summary
+    ? String((summary as { error: unknown }).error)
+    : null;
+  return detail ? `Audit failed: ${detail}` : "Audit failed.";
 }
 
 function readSummary(summary: unknown): AuditSummary {
